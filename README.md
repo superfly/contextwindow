@@ -23,8 +23,9 @@ import (
 
 func main() {
 	ctx := context.Background()
-  // reads OPENAI_API_KEY
-  model, err := NewOpenAIResponsesModel(shared.ResponsesModel4o)
+
+    // reads OPENAI_API_KEY
+    model, err := NewOpenAIResponsesModel(shared.ResponsesModel4o)
 	if err != nil {
 		log.Fatalf("Failed to create model: %v", err)
 	}
@@ -38,7 +39,7 @@ func main() {
 	}
 	defer cw.Close()
 
-  if err := cw.AddPrompt(ctx, "how's the weather over there?")
+    if err := cw.AddPrompt(ctx, "how's the weather over there?")
 	if err := cw.AddPrompt(ctx, prompt); err != nil {
 		log.Fatalf("Failed to add prompt: %v", err)
 	}
@@ -64,8 +65,8 @@ lsTool := contextwindow.NewTool("list_files", `
 cw.AddTool(lsTool, contextwindow.ToolRunnerFunc(func context.Context,
                                                 args json.RawMessage) (string, error) {
 	var treq struct {
-    Dir string `json:"directory"`
-  }
+      Dir string `json:"directory"`
+    }
 	json.Unmarshal(args, &treq)
 	// actually run ls, or pretend to
 	return "here\nare\nsome\nfiles.exe\n", nil
