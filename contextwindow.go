@@ -2,10 +2,84 @@
 // with opt-in LLM summarization for compaction, token count tracking, and a simple
 // tool call abstraction.
 //
+// # Abbreviated usage
+//
+//		    model, err := NewOpenAIResponsesModel(shared.ResponsesModel4o)
+//		    if err != nil {
+//			    log.Fatalf("Failed to create model: %v", err)
+//		    }
+//
+//	     cw, err := contextwindow.New(model, nil, "")
+//	     if err != nil {
+//		        log.Fatalf("Failed to create context window: %v", err)
+//	     }
+//	     defer cw.Close()
+//
+//	     if err := cw.AddPrompt(ctx, "how's the weather?"); err != nil {
+//			    log.Fatalf("Failed to add prompt: %v", err)
+//		    }
+//
+//	     response, err := cw.CallModel(ctx)
+//		    if err != nil {
+//			    log.Fatalf("Failed to call model: %v", err)
+//	     }
+//
+//	     fmt.Printf("response: %s\n", response)
+//
+// # System prompts
+//
+// Use [ContextWindow.SetSystemPrompt] to provide a system prompt for each
+// conversation.
+//
+// # Tool calling
+//
+// Instruct LLMs to call tools locally with [ContextWindow.AddTool] (and [NewTool]).
+//
+//	    lsTool := contextwindow.NewTool("list_files", `
+//	        This tool lists files in the specified directory.
+//	    `).AddStringParameter("directory", "Directory to list", true)
+//
+//	    cw.AddTool(lsTool, contextwindow.ToolRunnerFunc(func context.Context,
+//	                                                    args json.RawMessage) (string, error) {
+//	      var treq struct {
+//			    Dir string `json:"directory"`
+//		     }
+//	      json.Unmarshal(args, &treq)
+//	      // actually run ls, or pretend to
+//	      return "here\nare\nsome\nfiles.exe\n", nil
+//	    })
+//
+// You can selectively enable and disable tools with [ContextWindow.CallModelWithOpts].
+//
+// Tool calls are very sensitive to the descriptions provided of the tool and arguments
+// (the example up there is way too simple). Treat descriptions like part of the system
+// prompt; tell the agent what to do.
+//
+// # Summarization
+//
+// Models have context token limits (we use [github.com/peterheb/gotoken/cl100kbase] to
+// track usage); both input and output tokens count towards the limit.
+//
+// You can provide a summarizer model to automatically compact your context window:
+//
+//	    summarizerModel, err := openai.New(apiKey, "gpt-3.5-turbo")
+//	    if err != nil {
+//		       log.Fatalf("Failed to create summarizer: %v", err)
+//	    }
+//
+//	    cw, err := contextwindow.New(model, summarizerModel, "")
+//
+// And then "compress" your context with [ContextWindow.SummarizeLiveContent].
+//
+// # Under the hood
+//
 // A context window is just a list of strings, representing the history of a
 // "conversation" with an LLM. The "live" strings in a conversation will be
 // fed to the LLM on every call; we retain the "unalive" strings in records
 // so that tool calls can fetch them later.
+//
+// LLM conversations are stored in SQLite. If you don't care about persistant
+// storage for your context, just specify ":memory:" as your database path.
 package contextwindow
 
 import (
@@ -291,7 +365,10 @@ func (cw *ContextWindow) CallModelWithOpts(ctx context.Context, opts CallModelOp
 	var tokensUsed int
 	var responseID *string
 
-	// Use server-side threading if supported and enabled
+	// Serverside threading (`previous_response_id`) sends only the most recent prompt
+	// and a backlink to the last response, rather than sending the entire thread on
+	// every LLM call.
+	// TODO(tqbf): this stuff needs better testing; I don't really use it.
 	if contextInfo.UseServerSideThreading {
 		if threadingModel, ok := cw.model.(ServerSideThreadingCapable); ok {
 			if optsModel, ok := threadingModel.(CallOptsCapable); ok {
