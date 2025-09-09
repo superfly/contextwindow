@@ -1000,3 +1000,157 @@ func TestCallModelWithOpts(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, mockModel.LastOptsDisableTools, "Expected tools to be disabled")
 }
+
+func TestSwitchContext(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &dummyModel{}
+	cw, err := NewContextWindow(db, mockModel, "context1")
+	assert.NoError(t, err)
+
+	// Add some data to context1
+	err = cw.AddPrompt("Hello from context1")
+	assert.NoError(t, err)
+
+	// Create a second context
+	err = cw.CreateContext("context2")
+	assert.NoError(t, err)
+
+	// Switch to context2
+	err = cw.SwitchContext("context2")
+	assert.NoError(t, err)
+	assert.Equal(t, "context2", cw.GetCurrentContext())
+
+	// Add different data to context2
+	err = cw.AddPrompt("Hello from context2")
+	assert.NoError(t, err)
+
+	// Verify context2 has only its own data
+	ctx2Records, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Len(t, ctx2Records, 1)
+	assert.Contains(t, ctx2Records[0].Content, "context2")
+
+	// Switch back to context1
+	err = cw.SwitchContext("context1")
+	assert.NoError(t, err)
+	assert.Equal(t, "context1", cw.GetCurrentContext())
+
+	// Verify context1 still has its original data
+	ctx1Records, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Len(t, ctx1Records, 1)
+	assert.Contains(t, ctx1Records[0].Content, "context1")
+}
+
+func TestSwitchContextErrors(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &dummyModel{}
+	cw, err := NewContextWindow(db, mockModel, "initial")
+	assert.NoError(t, err)
+
+	// Test switching to empty name
+	err = cw.SwitchContext("")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "context name cannot be empty")
+	assert.Equal(t, "initial", cw.GetCurrentContext()) // Should remain unchanged
+
+	// Test switching to non-existent context
+	err = cw.SwitchContext("non-existent")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "switch context")
+	assert.Equal(t, "initial", cw.GetCurrentContext()) // Should remain unchanged
+}
+
+func TestSwitchContextWithComplexOperations(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &dummyModelTokens{
+		events: []Record{{
+			Source:    ModelResp,
+			Content:   "Response",
+			Live:      true,
+			EstTokens: tokenCount("Response"),
+		}},
+		tokens: 10,
+	}
+	cw, err := NewContextWindow(db, mockModel, "work")
+	assert.NoError(t, err)
+
+	// Create contexts for different purposes
+	err = cw.CreateContext("personal")
+	assert.NoError(t, err)
+	err = cw.CreateContext("research")
+	assert.NoError(t, err)
+
+	// Work context operations
+	err = cw.SetSystemPrompt("You are a work assistant")
+	assert.NoError(t, err)
+	err = cw.AddPrompt("What are my tasks today?")
+	assert.NoError(t, err)
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Switch to personal context
+	err = cw.SwitchContext("personal")
+	assert.NoError(t, err)
+	err = cw.SetSystemPrompt("You are a personal assistant")
+	assert.NoError(t, err)
+	err = cw.AddPrompt("What's the weather like?")
+	assert.NoError(t, err)
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Switch to research context
+	err = cw.SwitchContext("research")
+	assert.NoError(t, err)
+	err = cw.SetSystemPrompt("You are a research assistant")
+	assert.NoError(t, err)
+	err = cw.AddPrompt("Explain quantum computing")
+	assert.NoError(t, err)
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Verify each context has its own isolated data
+	contexts := []string{"work", "personal", "research"}
+	expectedPrompts := []string{"tasks today", "weather like", "quantum computing"}
+	expectedSystems := []string{"work assistant", "personal assistant", "research assistant"}
+
+	for i, contextName := range contexts {
+		err = cw.SwitchContext(contextName)
+		assert.NoError(t, err)
+
+		recs, err := cw.LiveRecords()
+		assert.NoError(t, err)
+		assert.GreaterOrEqual(t, len(recs), 3) // system + prompt + response
+
+		// Find system prompt, user prompt, and response
+		foundSystem := false
+		foundPrompt := false
+		foundResponse := false
+
+		for _, rec := range recs {
+			switch rec.Source {
+			case SystemPrompt:
+				assert.Contains(t, rec.Content, expectedSystems[i])
+				foundSystem = true
+			case Prompt:
+				assert.Contains(t, rec.Content, expectedPrompts[i])
+				foundPrompt = true
+			case ModelResp:
+				foundResponse = true
+			}
+		}
+
+		assert.True(t, foundSystem, "Context %s should have system prompt", contextName)
+		assert.True(t, foundPrompt, "Context %s should have user prompt", contextName)
+		assert.True(t, foundResponse, "Context %s should have response", contextName)
+	}
+}
