@@ -621,6 +621,21 @@ func (cw *ContextWindow) SetMaxTokens(max int) {
 	cw.maxTokens = max
 }
 
+// SwitchContext switches the ContextWindow to operate on a different existing context.
+func (cw *ContextWindow) SwitchContext(name string) error {
+	if name == "" {
+		return fmt.Errorf("context name cannot be empty")
+	}
+
+	_, err := GetContextByName(cw.db, name)
+	if err != nil {
+		return fmt.Errorf("switch context: %w", err)
+	}
+
+	cw.currentContext = name
+	return nil
+}
+
 // SetServerSideThreading enables or disables server-side threading for the current context.
 func (cw *ContextWindow) SetServerSideThreading(enabled bool) error {
 	contextID, err := getContextIDByName(cw.db, cw.currentContext)
