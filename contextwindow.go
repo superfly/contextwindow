@@ -89,6 +89,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -503,6 +504,14 @@ func (cw *ContextWindow) TokenUsage() (TokenUsage, error) {
 	}, nil
 }
 
+// ContextStats provides metrics for a specific context without expensive computation.
+type ContextStats struct {
+	LiveTokens   int        // tokens in live records
+	TotalRecords int        // total number of records
+	LiveRecords  int        // number of live records
+	LastActivity *time.Time // timestamp of most recent record, nil if no records
+}
+
 type TokenReporter interface {
 	TotalTokens() int
 	LiveTokens() (int, error)
@@ -652,4 +661,50 @@ func (cw *ContextWindow) IsServerSideThreadingEnabled() (bool, error) {
 		return false, err
 	}
 	return contextInfo.UseServerSideThreading, nil
+}
+
+// GetContextStats retrieves efficient statistics for any context.
+// All metrics are computed using database aggregations with existing indexes.
+func (cw *ContextWindow) GetContextStats(context Context) (ContextStats, error) {
+	stats := ContextStats{}
+
+	// Get record counts and live token sum in a single query
+	row := cw.db.QueryRow(`
+		SELECT 
+			COUNT(*) as total_records,
+			COUNT(CASE WHEN live = 1 THEN 1 END) as live_records,
+			COALESCE(SUM(CASE WHEN live = 1 THEN est_tokens ELSE 0 END), 0) as live_tokens,
+			MAX(ts) as last_activity
+		FROM records 
+		WHERE context_id = ?`,
+		context.ID,
+	)
+
+	var lastActivityStr sql.NullString
+	err := row.Scan(&stats.TotalRecords, &stats.LiveRecords, &stats.LiveTokens, &lastActivityStr)
+	if err != nil {
+		return ContextStats{}, fmt.Errorf("get context stats: %w", err)
+	}
+
+	if lastActivityStr.Valid && lastActivityStr.String != "" {
+		// Try multiple timestamp formats that SQLite might use
+		formats := []string{
+			"2006-01-02 15:04:05.999999999 -0700 MST", // SQLite format with timezone
+			"2006-01-02 15:04:05.999999999-07:00",
+			"2006-01-02 15:04:05.999999999",
+			"2006-01-02 15:04:05",
+			time.RFC3339,
+			time.RFC3339Nano,
+			"2006-01-02T15:04:05Z",
+			"2006-01-02T15:04:05.999999999Z",
+		}
+		for _, format := range formats {
+			if t, err := time.Parse(format, lastActivityStr.String); err == nil {
+				stats.LastActivity = &t
+				break
+			}
+		}
+	}
+
+	return stats, nil
 }
