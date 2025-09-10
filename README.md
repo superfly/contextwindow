@@ -82,6 +82,41 @@ data (like incoming email addresses), check carefully before relaying informatio
 side to the trusted side (for instance: instruct the untrusted side to provide responses in a
 JSON message you can parse in your code before handing off).
 
+## Context Management and Stats
+
+For building table views or managing multiple conversations, you can efficiently get statistics
+for any context without expensive operations:
+
+```go
+// Get all contexts
+contexts, err := cw.ListContexts()
+if err != nil {
+    log.Fatalf("Failed to list contexts: %v", err)
+}
+
+// Get efficient stats for each context (no table scans)
+for _, context := range contexts {
+    stats, err := cw.GetContextStats(context)
+    if err != nil {
+        log.Printf("Failed to get stats for %s: %v", context.Name, err)
+        continue
+    }
+    
+    fmt.Printf("Context: %s\n", context.Name)
+    fmt.Printf("  Created: %s\n", context.StartTime.Format("2006-01-02 15:04"))
+    fmt.Printf("  Live tokens: %d\n", stats.LiveTokens)
+    fmt.Printf("  Records: %d total, %d live\n", stats.TotalRecords, stats.LiveRecords)
+    if stats.LastActivity != nil {
+        fmt.Printf("  Last activity: %s\n", stats.LastActivity.Format("2006-01-02 15:04"))
+    } else {
+        fmt.Printf("  Last activity: never\n")
+    }
+}
+```
+
+The `GetContextStats` method uses a single aggregation query with existing indexes,
+making it efficient even with many contexts and large conversation histories.
+
 ## Maturity
 
 This is alpha-quality code. Happy to get feedback or PRs or whatever. Publishing this more

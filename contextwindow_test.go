@@ -1154,3 +1154,216 @@ func TestSwitchContextWithComplexOperations(t *testing.T) {
 		assert.True(t, foundResponse, "Context %s should have response", contextName)
 	}
 }
+
+func TestGetContextStats(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model := &MockModel{}
+	cw, err := NewContextWindow(db, model, "test-context")
+	assert.NoError(t, err)
+
+	// Test stats for empty context
+	ctx, err := cw.GetContext("test-context")
+	assert.NoError(t, err)
+
+	stats, err := cw.GetContextStats(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, stats.LiveTokens)
+	assert.Equal(t, 0, stats.TotalRecords)
+	assert.Equal(t, 0, stats.LiveRecords)
+	assert.Nil(t, stats.LastActivity)
+
+	// Add some records
+	err = cw.SetSystemPrompt("You are a helpful assistant")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("How are you?")
+	assert.NoError(t, err)
+
+	// Test stats with records
+	stats, err = cw.GetContextStats(ctx)
+	assert.NoError(t, err)
+	assert.Greater(t, stats.LiveTokens, 0)
+	assert.Equal(t, 3, stats.TotalRecords) // system prompt + 2 user prompts
+	assert.Equal(t, 3, stats.LiveRecords)
+	assert.NotNil(t, stats.LastActivity)
+
+	// Create another context to ensure stats are isolated
+	err = cw.CreateContext("other-context")
+	assert.NoError(t, err)
+
+	otherCtx, err := cw.GetContext("other-context")
+	assert.NoError(t, err)
+
+	otherStats, err := cw.GetContextStats(otherCtx)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, otherStats.LiveTokens)
+	assert.Equal(t, 0, otherStats.TotalRecords)
+	assert.Equal(t, 0, otherStats.LiveRecords)
+	assert.Nil(t, otherStats.LastActivity)
+
+	// Verify original context stats unchanged
+	stats, err = cw.GetContextStats(ctx)
+	assert.NoError(t, err)
+	assert.Greater(t, stats.LiveTokens, 0)
+	assert.Equal(t, 3, stats.TotalRecords)
+	assert.Equal(t, 3, stats.LiveRecords)
+}
+
+func TestGetContextStatsWithNonLiveRecords(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model := &MockModel{}
+	cw, err := NewContextWindow(db, model, "test-context")
+	assert.NoError(t, err)
+
+	// Add records and then mark some as non-live by adding a new system prompt
+	err = cw.SetSystemPrompt("First system prompt")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	// Replace system prompt - this marks old one as non-live
+	err = cw.SetSystemPrompt("Second system prompt")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("How are you?")
+	assert.NoError(t, err)
+
+	ctx, err := cw.GetContext("test-context")
+	assert.NoError(t, err)
+
+	stats, err := cw.GetContextStats(ctx)
+	assert.NoError(t, err)
+
+	// Should have 4 total records (2 system prompts + 2 user prompts)
+	// but only 3 live records (current system prompt + 2 user prompts)
+	assert.Equal(t, 4, stats.TotalRecords)
+	assert.Equal(t, 3, stats.LiveRecords)
+	assert.Greater(t, stats.LiveTokens, 0)
+	assert.NotNil(t, stats.LastActivity)
+
+	// Live tokens should be less than if all records were live
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	expectedLiveTokens := 0
+	for _, rec := range recs {
+		expectedLiveTokens += rec.EstTokens
+	}
+	assert.Equal(t, expectedLiveTokens, stats.LiveTokens)
+}
+
+func TestContextStatsForTableView(t *testing.T) {
+	// Simulate the use case: building a table view of contexts with their stats
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model := &MockModel{}
+	cw, err := NewContextWindow(db, model, "chat-1")
+	assert.NoError(t, err)
+
+	// Create multiple contexts with different amounts of content
+	contexts := []struct {
+		name    string
+		prompts []string
+	}{
+		{"chat-1", []string{"Hello", "How are you?", "Tell me about Go"}},
+		{"chat-2", []string{"What's the weather?"}},
+		{"empty-chat", []string{}},
+	}
+
+	for _, c := range contexts {
+		if c.name != "chat-1" {
+			err = cw.CreateContext(c.name)
+			assert.NoError(t, err)
+			err = cw.SwitchContext(c.name)
+			assert.NoError(t, err)
+		}
+
+		if len(c.prompts) > 0 {
+			err = cw.SetSystemPrompt("You are a helpful assistant")
+			assert.NoError(t, err)
+			for _, prompt := range c.prompts {
+				err = cw.AddPrompt(prompt)
+				assert.NoError(t, err)
+			}
+		}
+	}
+
+	// Now simulate getting stats for table view - this is the main use case
+	allContexts, err := cw.ListContexts()
+	assert.NoError(t, err)
+	assert.Len(t, allContexts, 3)
+
+	type ContextRow struct {
+		Name         string
+		Created      string
+		LiveTokens   int
+		TotalRecords int
+		LiveRecords  int
+		LastActivity string
+	}
+
+	var tableRows []ContextRow
+	for _, ctx := range allContexts {
+		stats, err := cw.GetContextStats(ctx)
+		assert.NoError(t, err)
+
+		lastActivity := "never"
+		if stats.LastActivity != nil {
+			lastActivity = stats.LastActivity.Format("2006-01-02 15:04")
+		}
+
+		row := ContextRow{
+			Name:         ctx.Name,
+			Created:      ctx.StartTime.Format("2006-01-02 15:04"),
+			LiveTokens:   stats.LiveTokens,
+			TotalRecords: stats.TotalRecords,
+			LiveRecords:  stats.LiveRecords,
+			LastActivity: lastActivity,
+		}
+		tableRows = append(tableRows, row)
+	}
+
+	// Verify the table data looks reasonable
+	assert.Len(t, tableRows, 3)
+
+	// Find each context and verify its stats
+	for _, row := range tableRows {
+		switch row.Name {
+		case "chat-1":
+			assert.Greater(t, row.LiveTokens, 0, "chat-1 should have tokens")
+			assert.Equal(t, 4, row.TotalRecords, "chat-1: system + 3 prompts")
+			assert.Equal(t, 4, row.LiveRecords, "chat-1: all records live")
+			assert.NotEqual(t, "never", row.LastActivity, "chat-1 should have activity")
+		case "chat-2":
+			assert.Greater(t, row.LiveTokens, 0, "chat-2 should have tokens")
+			assert.Equal(t, 2, row.TotalRecords, "chat-2: system + 1 prompt")
+			assert.Equal(t, 2, row.LiveRecords, "chat-2: all records live")
+			assert.NotEqual(t, "never", row.LastActivity, "chat-2 should have activity")
+		case "empty-chat":
+			assert.Equal(t, 0, row.LiveTokens, "empty-chat should have no tokens")
+			assert.Equal(t, 0, row.TotalRecords, "empty-chat should have no records")
+			assert.Equal(t, 0, row.LiveRecords, "empty-chat should have no live records")
+			assert.Equal(t, "never", row.LastActivity, "empty-chat should have no activity")
+		}
+	}
+
+	// Verify we can get stats efficiently for any context without switching
+	currentContext := cw.GetCurrentContext()
+	for _, ctx := range allContexts {
+		_, err := cw.GetContextStats(ctx)
+		assert.NoError(t, err, "Should be able to get stats for %s", ctx.Name)
+	}
+	// Current context should be unchanged
+	assert.Equal(t, currentContext, cw.GetCurrentContext())
+}
