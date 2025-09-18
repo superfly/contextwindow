@@ -638,7 +638,15 @@ func (cw *ContextWindow) SwitchContext(name string) error {
 
 	_, err := GetContextByName(cw.db, name)
 	if err != nil {
-		return fmt.Errorf("switch context: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Context doesn't exist, create it with default settings
+			_, err = CreateContext(cw.db, name)
+			if err != nil {
+				return fmt.Errorf("create context: %w", err)
+			}
+		} else {
+			return fmt.Errorf("switch context: %w", err)
+		}
 	}
 
 	cw.currentContext = name

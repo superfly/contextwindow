@@ -286,9 +286,14 @@ func TestContextNameConflict(t *testing.T) {
 	err = cw.CreateContext("test")
 	assert.NoError(t, err)
 
+	// With the new get-or-create behavior, this should succeed
 	err = cw.CreateContext("test")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "already exists")
+	assert.NoError(t, err)
+
+	// Verify the context exists and can be accessed
+	ctx, err := cw.GetContext("test")
+	assert.NoError(t, err)
+	assert.Equal(t, "test", ctx.Name)
 }
 
 func TestCreateContextWithExistingName(t *testing.T) {
@@ -1060,11 +1065,15 @@ func TestSwitchContextErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "context name cannot be empty")
 	assert.Equal(t, "initial", cw.GetCurrentContext()) // Should remain unchanged
 
-	// Test switching to non-existent context
+	// Test switching to non-existent context - should now create it
 	err = cw.SwitchContext("non-existent")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "switch context")
-	assert.Equal(t, "initial", cw.GetCurrentContext()) // Should remain unchanged
+	assert.NoError(t, err)
+	assert.Equal(t, "non-existent", cw.GetCurrentContext())
+
+	// Verify the context was created
+	ctx, err := cw.GetContext("non-existent")
+	assert.NoError(t, err)
+	assert.Equal(t, "non-existent", ctx.Name)
 }
 
 func TestSwitchContextWithComplexOperations(t *testing.T) {
@@ -1366,4 +1375,235 @@ func TestContextStatsForTableView(t *testing.T) {
 	}
 	// Current context should be unchanged
 	assert.Equal(t, currentContext, cw.GetCurrentContext())
+}
+
+// TestGetOrCreateBehavior tests that all context functions consistently support get-or-create
+func TestGetOrCreateBehavior(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model := &MockModel{}
+
+	// Test CreateContextWithThreading get-or-create behavior
+	t.Run("CreateContextWithThreading", func(t *testing.T) {
+		// First call should create the context
+		ctx1, err := CreateContextWithThreading(db, "test-create", true)
+		assert.NoError(t, err)
+		assert.Equal(t, "test-create", ctx1.Name)
+		assert.Equal(t, true, ctx1.UseServerSideThreading)
+
+		// Second call should return existing context
+		ctx2, err := CreateContextWithThreading(db, "test-create", true)
+		assert.NoError(t, err)
+		assert.Equal(t, ctx1.ID, ctx2.ID)
+		assert.Equal(t, ctx1.Name, ctx2.Name)
+
+		// Third call with different threading should update and return existing
+		ctx3, err := CreateContextWithThreading(db, "test-create", false)
+		assert.NoError(t, err)
+		assert.Equal(t, ctx1.ID, ctx3.ID)
+		assert.Equal(t, false, ctx3.UseServerSideThreading)
+	})
+
+	// Test SwitchContext create-if-not-exists behavior
+	t.Run("SwitchContext", func(t *testing.T) {
+		cw, err := NewContextWindow(db, model, "initial-context")
+		assert.NoError(t, err)
+
+		// Switch to non-existent context should create it
+		err = cw.SwitchContext("new-context")
+		assert.NoError(t, err)
+		assert.Equal(t, "new-context", cw.GetCurrentContext())
+
+		// Verify the context was actually created
+		ctx, err := GetContextByName(db, "new-context")
+		assert.NoError(t, err)
+		assert.Equal(t, "new-context", ctx.Name)
+
+		// Switch to existing context should work normally
+		err = cw.SwitchContext("new-context")
+		assert.NoError(t, err)
+		assert.Equal(t, "new-context", cw.GetCurrentContext())
+	})
+
+	// Test NewContextWindowWithThreading get-or-create behavior
+	t.Run("NewContextWindowWithThreading", func(t *testing.T) {
+		// Create context with threading
+		cw1, err := NewContextWindowWithThreading(db, model, "threading-test", true)
+		assert.NoError(t, err)
+
+		// Create another instance with same name - should use existing context
+		cw2, err := NewContextWindowWithThreading(db, model, "threading-test", false)
+		assert.NoError(t, err)
+
+		// Both should refer to the same context
+		assert.Equal(t, cw1.GetCurrentContext(), cw2.GetCurrentContext())
+
+		// Verify context exists in database
+		ctx, err := GetContextByName(db, "threading-test")
+		assert.NoError(t, err)
+		assert.Equal(t, "threading-test", ctx.Name)
+	})
+}
+
+// TestContextContinuation tests resuming contexts with existing messages
+func TestContextContinuation(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model := &MockModel{}
+
+	// Create initial context and add some messages
+	cw1, err := NewContextWindow(db, model, "continuation-test")
+	assert.NoError(t, err)
+
+	err = cw1.AddPrompt("First message")
+	assert.NoError(t, err)
+
+	err = cw1.AddPrompt("Second message")
+	assert.NoError(t, err)
+
+	// "Close" the context by creating a new instance
+	cw2, err := NewContextWindow(db, model, "continuation-test")
+	assert.NoError(t, err)
+
+	// Verify it loads the existing context
+	assert.Equal(t, "continuation-test", cw2.GetCurrentContext())
+
+	// Add a new message and verify all history is available
+	err = cw2.AddPrompt("Third message")
+	assert.NoError(t, err)
+
+	// Get context ID to check records
+	contextID, err := getContextIDByName(db, "continuation-test")
+	assert.NoError(t, err)
+
+	// Verify all messages are present
+	records, err := ListLiveRecords(db, contextID)
+	assert.NoError(t, err)
+
+	prompts := []string{}
+	for _, record := range records {
+		if record.Source == Prompt {
+			prompts = append(prompts, record.Content)
+		}
+	}
+
+	assert.Contains(t, prompts, "First message")
+	assert.Contains(t, prompts, "Second message")
+	assert.Contains(t, prompts, "Third message")
+	assert.Equal(t, 3, len(prompts))
+}
+
+// TestThreadingBehaviorResume tests threading behavior when resuming contexts
+func TestThreadingBehaviorResume(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	// Use a mock model that tracks threading calls
+	threadingModel := &MockThreadingModel{}
+
+	t.Run("ResumeWithServerSideThreading", func(t *testing.T) {
+		// Create context with server-side threading
+		cw1, err := NewContextWindowWithThreading(db, threadingModel, "threading-resume", true)
+		assert.NoError(t, err)
+
+		// Add initial prompt and get response
+		err = cw1.AddPrompt("Initial prompt")
+		assert.NoError(t, err)
+
+		_, err = cw1.CallModel(context.Background())
+		assert.NoError(t, err)
+
+		// "Close" and reopen context
+		cw2, err := NewContextWindowWithThreading(db, threadingModel, "threading-resume", true)
+		assert.NoError(t, err)
+
+		// Add another prompt
+		err = cw2.AddPrompt("Follow-up prompt")
+		assert.NoError(t, err)
+
+		// Verify the model receives the call appropriately
+		_, err = cw2.CallModel(context.Background())
+		assert.NoError(t, err)
+
+		// Check that the context was properly continued
+		ctx, err := GetContextByName(db, "threading-resume")
+		assert.NoError(t, err)
+		assert.Equal(t, true, ctx.UseServerSideThreading)
+	})
+
+	t.Run("ResumeWithClientSideThreading", func(t *testing.T) {
+		// Create context with client-side threading
+		cw1, err := NewContextWindowWithThreading(db, threadingModel, "client-resume", false)
+		assert.NoError(t, err)
+
+		// Add messages
+		err = cw1.AddPrompt("First client prompt")
+		assert.NoError(t, err)
+
+		_, err = cw1.CallModel(context.Background())
+		assert.NoError(t, err)
+
+		// Reopen context
+		cw2, err := NewContextWindowWithThreading(db, threadingModel, "client-resume", false)
+		assert.NoError(t, err)
+
+		err = cw2.AddPrompt("Second client prompt")
+		assert.NoError(t, err)
+
+		_, err = cw2.CallModel(context.Background())
+		assert.NoError(t, err)
+
+		// Verify context settings
+		ctx, err := GetContextByName(db, "client-resume")
+		assert.NoError(t, err)
+		assert.Equal(t, false, ctx.UseServerSideThreading)
+	})
+}
+
+// MockThreadingModel implements both interfaces for testing threading behavior
+type MockThreadingModel struct {
+	callCount int
+	lastInputs []Record
+	lastServerSide bool
+	lastResponseID *string
+}
+
+func (m *MockThreadingModel) Call(ctx context.Context, inputs []Record) ([]Record, int, error) {
+	m.callCount++
+	m.lastInputs = inputs
+	m.lastServerSide = false
+	m.lastResponseID = nil
+
+	return []Record{
+		{
+			Source:  ModelResp,
+			Content: fmt.Sprintf("Mock response %d", m.callCount),
+		},
+	}, 10, nil
+}
+
+func (m *MockThreadingModel) CallWithThreading(
+	ctx context.Context,
+	useServerSideThreading bool,
+	lastResponseID *string,
+	inputs []Record,
+) ([]Record, *string, int, error) {
+	m.callCount++
+	m.lastInputs = inputs
+	m.lastServerSide = useServerSideThreading
+	m.lastResponseID = lastResponseID
+
+	responseID := fmt.Sprintf("resp-%d", m.callCount)
+	return []Record{
+		{
+			Source:     ModelResp,
+			Content:    fmt.Sprintf("Mock threaded response %d", m.callCount),
+			ResponseID: &responseID,
+		},
+	}, &responseID, 10, nil
 }
