@@ -3,6 +3,7 @@ package contextwindow
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -135,14 +136,21 @@ func CreateContextWithThreading(db *sql.DB, name string, useServerSideThreading 
 		return Context{}, fmt.Errorf("context name cannot be empty")
 	}
 
-	// Check if name already exists
-	var exists bool
-	err := db.QueryRow(`SELECT 1 FROM contexts WHERE name = ?`, name).Scan(&exists)
-	if err != nil && err != sql.ErrNoRows {
-		return Context{}, fmt.Errorf("check context name uniqueness: %w", err)
+	// Check if context already exists - if so, return it
+	existingContext, err := GetContextByName(db, name)
+	if err == nil {
+		// Context exists, update threading mode if different
+		if existingContext.UseServerSideThreading != useServerSideThreading {
+			err = SetContextServerSideThreading(db, existingContext.ID, useServerSideThreading)
+			if err != nil {
+				return Context{}, fmt.Errorf("update threading mode: %w", err)
+			}
+			existingContext.UseServerSideThreading = useServerSideThreading
+		}
+		return existingContext, nil
 	}
-	if exists {
-		return Context{}, fmt.Errorf("context name '%s' already exists", name)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Context{}, fmt.Errorf("check existing context: %w", err)
 	}
 
 	id := uuid.New().String()
