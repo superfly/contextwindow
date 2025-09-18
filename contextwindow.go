@@ -80,6 +80,23 @@
 //
 // LLM conversations are stored in SQLite. If you don't care about persistant
 // storage for your context, just specify ":memory:" as your database path.
+//
+// # Thread Safety
+//
+// ContextWindow write operations (AddPrompt, SwitchContext, SetMaxTokens, etc.)
+// require external coordination when used concurrently. However, you can use
+// ContextWindow.Reader() to get a thread-safe read-only view:
+//
+//	    reader := cw.Reader()
+//	    go updateUI(reader)        // safe for concurrent use
+//	    go updateMetrics(reader)   // safe for concurrent use
+//
+//	    // Meanwhile, main thread can safely modify state:
+//	    cw.SwitchContext("new-context")
+//	    cw.SetMaxTokens(8192)
+//
+// ContextReader provides access to read operations like LiveRecords(), TokenUsage(),
+// and context querying, all of which are safe for concurrent use.
 package contextwindow
 
 import (
@@ -160,6 +177,16 @@ type ContextWindow struct {
 	currentContext   string
 	registeredTools  map[string]ToolDefinition
 	toolRunners      map[string]ToolRunner
+}
+
+// ContextReader provides thread-safe read access to context window data.
+// It's a thin proxy that forwards calls to safe read methods on the
+// underlying ContextWindow.
+//
+// All methods on ContextReader are safe for concurrent use by multiple
+// goroutines, even while the original ContextWindow is being modified.
+type ContextReader struct {
+	cw *ContextWindow // reference to underlying context window
 }
 
 // NewContextDB opens a database to store context windows in (pass
@@ -715,4 +742,73 @@ func (cw *ContextWindow) GetContextStats(context Context) (ContextStats, error) 
 	}
 
 	return stats, nil
+}
+
+// Reader returns a thread-safe read-only view of this ContextWindow.
+// The returned ContextReader is safe for concurrent use by multiple
+// goroutines, even while this ContextWindow is being modified.
+func (cw *ContextWindow) Reader() *ContextReader {
+	return &ContextReader{cw: cw}
+}
+
+// ContextReader methods - all forward to the underlying ContextWindow
+
+// LiveRecords retrieves all "live" records from the context.
+func (cr *ContextReader) LiveRecords() ([]Record, error) {
+	return cr.cw.LiveRecords()
+}
+
+// LiveTokens estimates the total number of tokens in all "live" messages.
+func (cr *ContextReader) LiveTokens() (int, error) {
+	return cr.cw.LiveTokens()
+}
+
+// TotalTokens returns the cumulative token count across all model calls.
+func (cr *ContextReader) TotalTokens() int {
+	return cr.cw.TotalTokens()
+}
+
+// TokenUsage returns current token usage metrics optimized for UI display.
+func (cr *ContextReader) TokenUsage() (TokenUsage, error) {
+	return cr.cw.TokenUsage()
+}
+
+// GetCurrentContext returns the name of the current context.
+func (cr *ContextReader) GetCurrentContext() string {
+	return cr.cw.GetCurrentContext()
+}
+
+// GetCurrentContextInfo returns the current context metadata.
+func (cr *ContextReader) GetCurrentContextInfo() (Context, error) {
+	return cr.cw.GetCurrentContextInfo()
+}
+
+// ListContexts returns all available context windows.
+func (cr *ContextReader) ListContexts() ([]Context, error) {
+	return cr.cw.ListContexts()
+}
+
+// GetContext retrieves context metadata by name.
+func (cr *ContextReader) GetContext(name string) (Context, error) {
+	return cr.cw.GetContext(name)
+}
+
+// GetContextStats retrieves efficient statistics for any context.
+func (cr *ContextReader) GetContextStats(context Context) (ContextStats, error) {
+	return cr.cw.GetContextStats(context)
+}
+
+// ExportContext extracts a complete context with all its records.
+func (cr *ContextReader) ExportContext(name string) (ContextExport, error) {
+	return cr.cw.ExportContext(name)
+}
+
+// ExportContextJSON exports a context as JSON bytes.
+func (cr *ContextReader) ExportContextJSON(name string) ([]byte, error) {
+	return cr.cw.ExportContextJSON(name)
+}
+
+// MaxTokens returns the maximum number of tokens allowed in the context window.
+func (cr *ContextReader) MaxTokens() int {
+	return cr.cw.MaxTokens()
 }

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/openai/openai-go/v2"
@@ -1606,4 +1607,282 @@ func (m *MockThreadingModel) CallWithThreading(
 			ResponseID: &responseID,
 		},
 	}, &responseID, 10, nil
+}
+
+// TestContextReader tests the thread-safe reader functionality
+func TestContextReader(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model := &MockModel{}
+	cw, err := NewContextWindow(db, model, "reader-test")
+	assert.NoError(t, err)
+
+	// Set up some test data
+	err = cw.SetSystemPrompt("You are a helpful assistant")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("How are you?")
+	assert.NoError(t, err)
+
+	// Create a reader
+	reader := cw.Reader()
+	assert.NotNil(t, reader)
+
+	// Test that reader methods work and return expected data
+	t.Run("LiveRecords", func(t *testing.T) {
+		records, err := reader.LiveRecords()
+		assert.NoError(t, err)
+		assert.Len(t, records, 3) // system prompt + 2 user prompts
+
+		// Verify record types
+		foundSystem, foundPrompts := false, 0
+		for _, rec := range records {
+			switch rec.Source {
+			case SystemPrompt:
+				foundSystem = true
+			case Prompt:
+				foundPrompts++
+			}
+		}
+		assert.True(t, foundSystem)
+		assert.Equal(t, 2, foundPrompts)
+	})
+
+	t.Run("LiveTokens", func(t *testing.T) {
+		tokens, err := reader.LiveTokens()
+		assert.NoError(t, err)
+		assert.Greater(t, tokens, 0)
+	})
+
+	t.Run("TotalTokens", func(t *testing.T) {
+		// Initially should be 0 since no model calls made
+		total := reader.TotalTokens()
+		assert.Equal(t, 0, total)
+	})
+
+	t.Run("TokenUsage", func(t *testing.T) {
+		usage, err := reader.TokenUsage()
+		assert.NoError(t, err)
+		assert.Greater(t, usage.Live, 0)
+		assert.Equal(t, 0, usage.Total) // No model calls yet
+		assert.Equal(t, 4096, usage.Max)
+		assert.Greater(t, usage.Percent, 0.0)
+	})
+
+	t.Run("GetCurrentContext", func(t *testing.T) {
+		current := reader.GetCurrentContext()
+		assert.Equal(t, "reader-test", current)
+	})
+
+	t.Run("GetCurrentContextInfo", func(t *testing.T) {
+		ctx, err := reader.GetCurrentContextInfo()
+		assert.NoError(t, err)
+		assert.Equal(t, "reader-test", ctx.Name)
+	})
+
+	t.Run("ListContexts", func(t *testing.T) {
+		contexts, err := reader.ListContexts()
+		assert.NoError(t, err)
+		assert.GreaterOrEqual(t, len(contexts), 1)
+
+		found := false
+		for _, ctx := range contexts {
+			if ctx.Name == "reader-test" {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found)
+	})
+
+	t.Run("GetContext", func(t *testing.T) {
+		ctx, err := reader.GetContext("reader-test")
+		assert.NoError(t, err)
+		assert.Equal(t, "reader-test", ctx.Name)
+	})
+
+	t.Run("GetContextStats", func(t *testing.T) {
+		ctx, err := reader.GetContext("reader-test")
+		assert.NoError(t, err)
+
+		stats, err := reader.GetContextStats(ctx)
+		assert.NoError(t, err)
+		assert.Greater(t, stats.LiveTokens, 0)
+		assert.Equal(t, 3, stats.TotalRecords)
+		assert.Equal(t, 3, stats.LiveRecords)
+	})
+
+	t.Run("ExportContext", func(t *testing.T) {
+		export, err := reader.ExportContext("reader-test")
+		assert.NoError(t, err)
+		assert.Equal(t, "reader-test", export.Context.Name)
+		assert.Len(t, export.Records, 3)
+	})
+
+	t.Run("ExportContextJSON", func(t *testing.T) {
+		jsonData, err := reader.ExportContextJSON("reader-test")
+		assert.NoError(t, err)
+		assert.Greater(t, len(jsonData), 0)
+		assert.Contains(t, string(jsonData), "reader-test")
+	})
+
+	t.Run("MaxTokens", func(t *testing.T) {
+		maxTokens := reader.MaxTokens()
+		assert.Equal(t, 4096, maxTokens)
+	})
+}
+
+// TestContextReaderConcurrency tests that ContextReader is safe for concurrent use
+func TestContextReaderConcurrency(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model := &MockModel{}
+	cw, err := NewContextWindow(db, model, "concurrency-test")
+	assert.NoError(t, err)
+
+	// Set up initial data
+	err = cw.SetSystemPrompt("You are a helpful assistant")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("Initial prompt")
+	assert.NoError(t, err)
+
+	// Create reader
+	reader := cw.Reader()
+
+	// Test that multiple concurrent readers can access the same methods
+	// without causing crashes or data races
+	var wg sync.WaitGroup
+	success := int32(0)
+
+	// Start multiple concurrent readers doing read-only operations
+	numReaders := 3
+	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("Reader %d panicked: %v", id, r)
+				}
+			}()
+
+			// Test basic read operations that should always work
+			context := reader.GetCurrentContext()
+			if context != "concurrency-test" {
+				t.Errorf("Reader %d: expected context 'concurrency-test', got %s", id, context)
+				return
+			}
+
+			maxTokens := reader.MaxTokens()
+			if maxTokens <= 0 {
+				t.Errorf("Reader %d: expected positive maxTokens, got %d", id, maxTokens)
+				return
+			}
+
+			totalTokens := reader.TotalTokens()
+			if totalTokens < 0 {
+				t.Errorf("Reader %d: expected non-negative totalTokens, got %d", id, totalTokens)
+				return
+			}
+
+			// If we get here, all operations succeeded
+			atomic.AddInt32(&success, 1)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All readers should have completed successfully
+	assert.Equal(t, int32(numReaders), atomic.LoadInt32(&success), "All readers should complete successfully")
+
+	// Verify that reader still works after concurrent access
+	currentContext := reader.GetCurrentContext()
+	assert.Equal(t, "concurrency-test", currentContext)
+
+	maxTokens := reader.MaxTokens()
+	assert.Greater(t, maxTokens, 0)
+}
+
+// TestContextReaderWithMultipleContexts tests reader behavior across context switches
+func TestContextReaderWithMultipleContexts(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model := &MockModel{}
+	cw, err := NewContextWindow(db, model, "context-a")
+	assert.NoError(t, err)
+
+	// Set up context-a
+	err = cw.AddPrompt("Message in context A")
+	assert.NoError(t, err)
+
+	// Create reader for context-a
+	readerA := cw.Reader()
+
+	// Switch to context-b
+	err = cw.SwitchContext("context-b")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("Message in context B")
+	assert.NoError(t, err)
+
+	// Create reader for context-b
+	readerB := cw.Reader()
+
+	// Test that each reader reflects the current state (not snapshots)
+	// Since ContextReader is a proxy, it shows the current context state
+	t.Run("ReaderA sees current context state", func(t *testing.T) {
+		current := readerA.GetCurrentContext()
+		assert.Equal(t, "context-b", current) // Should reflect current context
+
+		// readerA now sees context-b because the underlying ContextWindow switched
+		records, err := readerA.LiveRecords()
+		assert.NoError(t, err)
+		assert.Len(t, records, 1)
+		assert.Contains(t, records[0].Content, "context B")
+	})
+
+	t.Run("ReaderB sees context-b", func(t *testing.T) {
+		current := readerB.GetCurrentContext()
+		assert.Equal(t, "context-b", current)
+
+		records, err := readerB.LiveRecords()
+		assert.NoError(t, err)
+		assert.Len(t, records, 1)
+		assert.Contains(t, records[0].Content, "context B")
+	})
+
+	t.Run("Both readers can list all contexts", func(t *testing.T) {
+		contextsA, err := readerA.ListContexts()
+		assert.NoError(t, err)
+
+		contextsB, err := readerB.ListContexts()
+		assert.NoError(t, err)
+
+		// Both should see the same contexts
+		assert.Equal(t, len(contextsA), len(contextsB))
+		assert.GreaterOrEqual(t, len(contextsA), 2)
+	})
+
+	t.Run("Both readers can access any context by name", func(t *testing.T) {
+		ctxA, err := readerA.GetContext("context-a")
+		assert.NoError(t, err)
+		assert.Equal(t, "context-a", ctxA.Name)
+
+		ctxB, err := readerB.GetContext("context-a")
+		assert.NoError(t, err)
+		assert.Equal(t, "context-a", ctxB.Name)
+
+		// They should see the same context
+		assert.Equal(t, ctxA.ID, ctxB.ID)
+	})
 }
