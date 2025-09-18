@@ -4,24 +4,24 @@
 //
 // # Abbreviated usage
 //
-//		    model, err := NewOpenAIResponsesModel(shared.ResponsesModel4o)
-//		    if err != nil {
-//			    log.Fatalf("Failed to create model: %v", err)
-//		    }
+//           model, err := NewOpenAIResponsesModel(shared.ResponsesModel4o)
+//           if err != nil {
+//             log.Fatalf("Failed to create model: %v", err)
+//           }
 //
 //	     cw, err := contextwindow.New(model, nil, "")
 //	     if err != nil {
-//		        log.Fatalf("Failed to create context window: %v", err)
+//             log.Fatalf("Failed to create context window: %v", err)
 //	     }
 //	     defer cw.Close()
 //
 //	     if err := cw.AddPrompt(ctx, "how's the weather?"); err != nil {
-//			    log.Fatalf("Failed to add prompt: %v", err)
-//		    }
+//             log.Fatalf("Failed to add prompt: %v", err)
+//           }
 //
 //	     response, err := cw.CallModel(ctx)
-//		    if err != nil {
-//			    log.Fatalf("Failed to call model: %v", err)
+//           if err != nil {
+//             log.Fatalf("Failed to call model: %v", err)
 //	     }
 //
 //	     fmt.Printf("response: %s\n", response)
@@ -41,10 +41,10 @@
 //
 //	    cw.AddTool(lsTool, contextwindow.ToolRunnerFunc(func context.Context,
 //	                                                    args json.RawMessage) (string, error) {
-//	      var treq struct {
-//			    Dir string `json:"directory"`
-//		     }
-//	      json.Unmarshal(args, &treq)
+//	    var treq struct {
+//            Dir string `json:"directory"`
+//          }
+//	    json.Unmarshal(args, &treq)
 //	      // actually run ls, or pretend to
 //	      return "here\nare\nsome\nfiles.exe\n", nil
 //	    })
@@ -64,7 +64,7 @@
 //
 //	    summarizerModel, err := openai.New(apiKey, "gpt-3.5-turbo")
 //	    if err != nil {
-//		       log.Fatalf("Failed to create summarizer: %v", err)
+//            log.Fatalf("Failed to create summarizer: %v", err)
 //	    }
 //
 //	    cw, err := contextwindow.New(model, summarizerModel, "")
