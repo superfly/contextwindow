@@ -1937,8 +1937,8 @@ func TestContextCloning(t *testing.T) {
 		assert.NotEqual(t, originalRecords[i].ContextID, clonedRecords[i].ContextID)
 	}
 
-	// Test CloneFrom (arbitrary context)
-	err = cw.CloneFrom("original", "another-clone")
+	// Test CloneContext (package-level function for arbitrary context)
+	err = CloneContext(db, "original", "another-clone")
 	assert.NoError(t, err)
 
 	// Switch to the new clone and verify
@@ -1957,7 +1957,7 @@ func TestContextCloning(t *testing.T) {
 	})
 
 	t.Run("cannot clone from non-existent context", func(t *testing.T) {
-		err := cw.CloneFrom("does-not-exist", "new-clone")
+		err := CloneContext(db, "does-not-exist", "new-clone")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "source context not found")
 	})
@@ -1966,10 +1966,10 @@ func TestContextCloning(t *testing.T) {
 		err := cw.Clone("")
 		assert.Error(t, err)
 
-		err = cw.CloneFrom("original", "")
+		err = CloneContext(db, "original", "")
 		assert.Error(t, err)
 
-		err = cw.CloneFrom("", "new-name")
+		err = CloneContext(db, "", "new-name")
 		assert.Error(t, err)
 	})
 }

@@ -632,3 +632,44 @@ func addColumnIfNotExists(db *sql.DB, tableName, columnName, columnDef string) e
 
 	return nil
 }
+
+// CloneContext creates a copy of the specified source context with a new name.
+func CloneContext(db *sql.DB, sourceName, destName string) error {
+	if sourceName == "" || destName == "" {
+		return fmt.Errorf("source and destination context names cannot be empty")
+	}
+
+	// Get source context
+	sourceContext, err := GetContextByName(db, sourceName)
+	if err != nil {
+		return fmt.Errorf("clone from %s to %s: source context not found: %w", sourceName, destName, err)
+	}
+
+	// Check if destination already exists
+	_, err = GetContextByName(db, destName)
+	if err == nil {
+		return fmt.Errorf("clone from %s to %s: destination context already exists", sourceName, destName)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("clone from %s to %s: %w", sourceName, destName, err)
+	}
+
+	// Create destination context with same threading settings
+	destContext, err := CreateContextWithThreading(db, destName, sourceContext.UseServerSideThreading)
+	if err != nil {
+		return fmt.Errorf("clone from %s to %s: create destination context: %w", sourceName, destName, err)
+	}
+
+	// Copy all records from source to destination
+	_, err = db.Exec(`
+		INSERT INTO records (context_id, source, content, live, est_tokens, ts, response_id)
+		SELECT ?, source, content, live, est_tokens, ts, response_id
+		FROM records
+		WHERE context_id = ?`,
+		destContext.ID, sourceContext.ID)
+	if err != nil {
+		return fmt.Errorf("clone from %s to %s: copy records: %w", sourceName, destName, err)
+	}
+
+	return nil
+}
