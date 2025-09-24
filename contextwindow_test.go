@@ -1886,3 +1886,90 @@ func TestContextReaderWithMultipleContexts(t *testing.T) {
 		assert.Equal(t, ctxA.ID, ctxB.ID)
 	})
 }
+
+func TestContextCloning(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model := &MockModel{
+		events: []Record{
+			{Source: ModelResp, Content: "Hello there!", Live: true},
+		},
+	}
+
+	cw, err := NewContextWindow(db, model, "original")
+	assert.NoError(t, err)
+
+	// Add some content to the original context
+	err = cw.AddPrompt("What's the weather like?")
+	assert.NoError(t, err)
+
+	err = cw.SetSystemPrompt("You are a helpful assistant.")
+	assert.NoError(t, err)
+
+	// Get a response to create more records
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Get original records for comparison
+	originalRecords, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Greater(t, len(originalRecords), 0)
+
+	// Test Clone (current context)
+	err = cw.Clone("cloned")
+	assert.NoError(t, err)
+
+	// Switch to cloned context and verify it has the same records
+	err = cw.SwitchContext("cloned")
+	assert.NoError(t, err)
+
+	clonedRecords, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Equal(t, len(originalRecords), len(clonedRecords))
+
+	// Records should have same content but different context_id
+	for i := range originalRecords {
+		assert.Equal(t, originalRecords[i].Content, clonedRecords[i].Content)
+		assert.Equal(t, originalRecords[i].Source, clonedRecords[i].Source)
+		assert.Equal(t, originalRecords[i].Live, clonedRecords[i].Live)
+		assert.NotEqual(t, originalRecords[i].ContextID, clonedRecords[i].ContextID)
+	}
+
+	// Test CloneFrom (arbitrary context)
+	err = cw.CloneFrom("original", "another-clone")
+	assert.NoError(t, err)
+
+	// Switch to the new clone and verify
+	err = cw.SwitchContext("another-clone")
+	assert.NoError(t, err)
+
+	anotherClonedRecords, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Equal(t, len(originalRecords), len(anotherClonedRecords))
+
+	// Test error cases
+	t.Run("cannot clone to existing context", func(t *testing.T) {
+		err := cw.Clone("original") // already exists
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "already exists")
+	})
+
+	t.Run("cannot clone from non-existent context", func(t *testing.T) {
+		err := cw.CloneFrom("does-not-exist", "new-clone")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "source context not found")
+	})
+
+	t.Run("empty names not allowed", func(t *testing.T) {
+		err := cw.Clone("")
+		assert.Error(t, err)
+
+		err = cw.CloneFrom("original", "")
+		assert.Error(t, err)
+
+		err = cw.CloneFrom("", "new-name")
+		assert.Error(t, err)
+	})
+}
