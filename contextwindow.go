@@ -308,6 +308,53 @@ func (cw *ContextWindow) AddToolOutput(output string) error {
 	return nil
 }
 
+// SetRecordLiveStateByRange updates the live status of records in the specified range.
+// Indices are based on the current LiveRecords() slice, with both start and end inclusive.
+// This allows selective marking of context elements as active (live=true) or 
+// inactive (live=false) based on their position in the conversation.
+//
+// Examples:
+//   SetRecordLiveStateByRange(2, 4, false) // marks records at indices 2, 3, 4 as dead
+//   SetRecordLiveStateByRange(5, 5, false) // marks only record at index 5 as dead
+func (cw *ContextWindow) SetRecordLiveStateByRange(startIndex, endIndex int, live bool) error {
+	if startIndex < 0 || endIndex < startIndex {
+		return fmt.Errorf("invalid range: startIndex=%d, endIndex=%d", startIndex, endIndex)
+	}
+
+	liveRecords, err := cw.LiveRecords()
+	if err != nil {
+		return fmt.Errorf("get live records: %w", err)
+	}
+
+	if startIndex >= len(liveRecords) {
+		return fmt.Errorf("startIndex %d out of range (have %d records)", startIndex, len(liveRecords))
+	}
+	if endIndex >= len(liveRecords) {
+		return fmt.Errorf("endIndex %d out of range (have %d records)", endIndex, len(liveRecords))
+	}
+
+	tx, err := cw.db.Begin()
+	if err != nil {
+		return fmt.Errorf("set record live state by range: %w", err)
+	}
+	defer tx.Rollback()
+
+	liveValue := 0
+	if live {
+		liveValue = 1
+	}
+
+	for i := startIndex; i <= endIndex; i++ {
+		recordID := liveRecords[i].ID
+		_, err = tx.Exec(`UPDATE records SET live = ? WHERE id = ?`, liveValue, recordID)
+		if err != nil {
+			return fmt.Errorf("set record %d live state: %w", recordID, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
 // SetSystemPrompt sets the system prompt for the current context.
 func (cw *ContextWindow) SetSystemPrompt(text string) error {
 	contextID, err := getContextIDByName(cw.db, cw.currentContext)
