@@ -1973,3 +1973,120 @@ func TestContextCloning(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
+
+func TestContextWindow_SetRecordLiveStateByRange(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	cw, err := NewContextWindow(db, &dummyModel{}, "")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("Hello world")
+	assert.NoError(t, err)
+
+	err = cw.AddToolCall("test_tool", `{"arg": "value"}`)
+	assert.NoError(t, err)
+
+	err = cw.AddToolOutput("Tool output response")
+	assert.NoError(t, err)
+
+	liveRecords, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Len(t, liveRecords, 3)
+	assert.Equal(t, Prompt, liveRecords[0].Source)
+	assert.Equal(t, ToolCall, liveRecords[1].Source) 
+	assert.Equal(t, ToolOutput, liveRecords[2].Source)
+
+	err = cw.SetRecordLiveStateByRange(1, 2, false)
+	assert.NoError(t, err)
+
+	liveRecordsAfter, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Len(t, liveRecordsAfter, 1)
+	assert.Equal(t, Prompt, liveRecordsAfter[0].Source)
+	assert.Equal(t, "Hello world", liveRecordsAfter[0].Content)
+}
+
+func TestContextWindow_SetRecordLiveStateByRange_SingleRecord(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	cw, err := NewContextWindow(db, &dummyModel{}, "")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("First prompt")
+	assert.NoError(t, err)
+	err = cw.AddPrompt("Second prompt")
+	assert.NoError(t, err)
+	err = cw.AddPrompt("Third prompt")
+	assert.NoError(t, err)
+
+	liveRecords, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Len(t, liveRecords, 3)
+
+	err = cw.SetRecordLiveStateByRange(1, 1, false)
+	assert.NoError(t, err)
+
+	liveRecordsAfter, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Len(t, liveRecordsAfter, 2)
+	assert.Equal(t, "First prompt", liveRecordsAfter[0].Content)
+	assert.Equal(t, "Third prompt", liveRecordsAfter[1].Content)
+}
+
+func TestContextWindow_SetRecordLiveStateByRange_ErrorCases(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	cw, err := NewContextWindow(db, &dummyModel{}, "")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("Test prompt")
+	assert.NoError(t, err)
+
+	err = cw.SetRecordLiveStateByRange(-1, 0, false)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid range")
+
+	err = cw.SetRecordLiveStateByRange(2, 1, false) 
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid range")
+
+	err = cw.SetRecordLiveStateByRange(5, 5, false)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+
+	err = cw.SetRecordLiveStateByRange(0, 5, false)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+}
+func TestContextWindow_SetRecordLiveStateByRange_Revive(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	cw, err := NewContextWindow(db, &dummyModel{}, "")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("First")
+	assert.NoError(t, err)
+	err = cw.AddPrompt("Second") 
+	assert.NoError(t, err)
+	err = cw.AddPrompt("Third")
+	assert.NoError(t, err)
+
+	liveRecords, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Len(t, liveRecords, 3)
+
+	err = cw.SetRecordLiveStateByRange(0, 2, false)
+	assert.NoError(t, err)
+
+	liveRecordsAfterDead, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Len(t, liveRecordsAfterDead, 0)
+}
