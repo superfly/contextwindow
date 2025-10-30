@@ -191,9 +191,15 @@ func getToolParamsFromDefinitions(availableTools []ToolDefinition) []llmToolPara
 	for _, tool := range availableTools {
 		if funcDef, ok := tool.Definition.(openai.FunctionDefinitionParam); ok {
 			toolParams = append(toolParams, openai.ChatCompletionFunctionTool(funcDef))
-		} else {
-			panic(fmt.Sprintf("can't add tool definition for %+v", tool))
+			continue
 		}
+
+		if builder, ok := tool.Definition.(*ToolBuilder); ok {
+			toolParams = append(toolParams, openai.ChatCompletionFunctionTool(builder.ToOpenAI()))
+			continue
+		}
+
+		panic(fmt.Sprintf("can't add tool definition for %s (type: %T)", tool.Name, tool.Definition))
 	}
 	return toolParams
 }

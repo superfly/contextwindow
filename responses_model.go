@@ -310,7 +310,26 @@ func getResponsesToolParamsFromDefinitions(availableTools []ToolDefinition) []re
 			toolParams = append(toolParams, responses.ToolUnionParam{
 				OfFunction: &functionTool,
 			})
+			continue
 		}
+
+		if builder, ok := tool.Definition.(*ToolBuilder); ok {
+			funcDef := builder.ToOpenAI()
+			functionTool := responses.FunctionToolParam{
+				Name:       funcDef.Name,
+				Parameters: funcDef.Parameters,
+				Strict:     funcDef.Strict,
+			}
+			if funcDef.Description.Valid() {
+				functionTool.Description = funcDef.Description
+			}
+			toolParams = append(toolParams, responses.ToolUnionParam{
+				OfFunction: &functionTool,
+			})
+			continue
+		}
+
+		panic(fmt.Sprintf("can't convert tool definition for %s to Responses format (type: %T)", tool.Name, tool.Definition))
 	}
 	return toolParams
 }
