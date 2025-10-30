@@ -1,6 +1,7 @@
 package contextwindow
 
 import (
+	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/openai/openai-go/v2"
 )
 
@@ -147,8 +148,65 @@ func (tb *ToolBuilder) parameterToOpenAISchema(param *Parameter) map[string]any 
 	return schema
 }
 
+func (tb *ToolBuilder) ToClaude() anthropic.ToolParam {
+	properties := make(map[string]interface{})
+	required := make([]string, 0)
+
+	for _, p := range tb.parameters {
+		properties[p.Name] = tb.parameterToClaudeSchema(p)
+		if p.Required {
+			required = append(required, p.Name)
+		}
+	}
+
+	return anthropic.ToolParam{
+		Name: tb.name,
+		Description: anthropic.String(tb.description),
+		InputSchema: anthropic.ToolInputSchemaParam{
+			Properties: properties,
+			Required:   required,
+		},
+	}
+}
+
+func (tb *ToolBuilder) parameterToClaudeSchema(param *Parameter) map[string]interface{} {
+	schema := map[string]interface{}{
+		"type": string(param.Type),
+	}
+
+	if param.Description != "" {
+		schema["description"] = param.Description
+	}
+
+	switch param.Type {
+	case ParameterTypeArray:
+		if param.Items != nil {
+			schema["items"] = tb.parameterToClaudeSchema(param.Items)
+		}
+	case ParameterTypeObject:
+		if param.Properties != nil {
+			properties := make(map[string]interface{})
+			required := make([]string, 0)
+			for name, prop := range param.Properties {
+				properties[name] = tb.parameterToClaudeSchema(prop)
+				if prop.Required {
+					required = append(required, name)
+				}
+			}
+			schema["properties"] = properties
+			if len(required) > 0 {
+				schema["required"] = required
+			}
+		}
+	}
+
+	return schema
+}
+
 func (cw *ContextWindow) AddTool(tool *ToolBuilder, runner ToolRunner) error {
-	return cw.RegisterTool(tool.name, tool.ToOpenAI(), runner)
+	// Store the ToolBuilder itself, not the converted format
+	// This allows different models to convert it as needed
+	return cw.RegisterTool(tool.name, tool, runner)
 }
 
 func (cw *ContextWindow) AddToolFromJSON(name string, jsonDefinition interface{}, runner ToolRunner) error {
