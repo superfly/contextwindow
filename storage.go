@@ -673,3 +673,93 @@ func CloneContext(db *sql.DB, sourceName, destName string) error {
 
 	return nil
 }
+
+// ValidateResponseIDChain checks if a response_id chain is valid for server-side threading.
+// Returns true if the chain is valid, false otherwise, along with a reason.
+func ValidateResponseIDChain(db *sql.DB, contextID string) (bool, string) {
+	// Get context to check LastResponseID
+	ctx, err := GetContext(db, contextID)
+	if err != nil {
+		return false, fmt.Sprintf("cannot get context: %v", err)
+	}
+
+	// If no LastResponseID, chain is invalid
+	if ctx.LastResponseID == nil || *ctx.LastResponseID == "" {
+		return false, "no last_response_id set"
+	}
+
+	// Get all live records
+	records, err := ListLiveRecords(db, contextID)
+	if err != nil {
+		return false, fmt.Sprintf("cannot list records: %v", err)
+	}
+
+	// Check for tool calls - these break server-side threading
+	for _, rec := range records {
+		if rec.Source == ToolCall || rec.Source == ToolOutput {
+			return false, "tool calls present (break server-side threading)"
+		}
+	}
+
+	// Find all ModelResp records
+	var modelResponses []Record
+	for _, rec := range records {
+		if rec.Source == ModelResp {
+			modelResponses = append(modelResponses, rec)
+		}
+	}
+
+	// If no model responses, chain is valid (first call)
+	if len(modelResponses) == 0 {
+		return true, "no model responses yet (first call)"
+	}
+
+	// Check for gaps in response_id chain
+	hasResponseIDs := false
+	hasMissingResponseIDs := false
+	lastResponseIDExists := false
+
+	for _, rec := range modelResponses {
+		if rec.ResponseID != nil && *rec.ResponseID != "" {
+			hasResponseIDs = true
+			// Check if this matches the context's LastResponseID (for existence check)
+			if ctx.LastResponseID != nil && *rec.ResponseID == *ctx.LastResponseID {
+				lastResponseIDExists = true
+			}
+		} else {
+			hasMissingResponseIDs = true
+		}
+	}
+
+	// Edge case: Context has LastResponseID but no matching record exists
+	// This can happen after export/import or manual database edits
+	if ctx.LastResponseID != nil && *ctx.LastResponseID != "" && !lastResponseIDExists {
+		return false, fmt.Sprintf("last_response_id (%v) does not exist in records (chain broken, possibly after export/import)",
+			*ctx.LastResponseID)
+	}
+
+	// Mixed state is invalid
+	if hasResponseIDs && hasMissingResponseIDs {
+		return false, "mixed response_id state (some records missing IDs)"
+	}
+
+	// Last response must match context's LastResponseID
+	// Get the last response ID from records
+	lastResponseID := getLastResponseID(records)
+	if lastResponseID == nil || ctx.LastResponseID == nil || *lastResponseID != *ctx.LastResponseID {
+		return false, fmt.Sprintf("last response_id (%v) does not match context (%v)",
+			lastResponseID, ctx.LastResponseID)
+	}
+
+	return true, "chain valid"
+}
+
+// getLastResponseID is a helper to get the last response ID from records.
+func getLastResponseID(records []Record) *string {
+	for i := len(records) - 1; i >= 0; i-- {
+		if records[i].Source == ModelResp && records[i].ResponseID != nil {
+			return records[i].ResponseID
+		}
+	}
+	return nil
+}

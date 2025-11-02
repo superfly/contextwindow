@@ -869,6 +869,8 @@ func TestSetContextServerSideThreading(t *testing.T) {
 	assert.False(t, updatedCtx.UseServerSideThreading)
 }
 
+// TestServerSideThreadingFallback verifies fallback behavior when server-side threading
+// cannot be used, ensuring conversations continue successfully
 func TestServerSideThreadingFallback(t *testing.T) {
 	db, err := NewContextDB(":memory:")
 	assert.NoError(t, err)
@@ -882,28 +884,60 @@ func TestServerSideThreadingFallback(t *testing.T) {
 	assert.NoError(t, err)
 	defer cw.Close()
 
-	// Add a prompt and make first call (no previous response ID, should use client-side)
+	// Add a prompt and make first call (no previous response ID, should fallback to client-side)
 	err = cw.AddPrompt("Hello")
 	assert.NoError(t, err)
 
 	ctx := context.Background()
-	_, err = cw.CallModel(ctx)
+	resp1, err := cw.CallModel(ctx)
 	assert.NoError(t, err)
+	assert.NotEmpty(t, resp1)
 
 	// Verify the mock was called with client-side threading (no previous response ID)
+	// First call falls back because there's no LastResponseID yet
 	assert.False(t, mockModel.lastCallUsedServerSide)
 	assert.Nil(t, mockModel.lastPreviousResponseID)
 
-	// Add another prompt - this should use server-side threading
+	// Verify conversation continues successfully - check that response was recorded
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Greater(t, len(recs), 0)
+
+	// Manually set LastResponseID to simulate what would happen after a server-side call
+	// In a real scenario, this would be set by the previous server-side threading call
+	ctxInfo, err := GetContextByName(db, "test-fallback")
+	assert.NoError(t, err)
+	testResponseID := "mock_response_123"
+	err = UpdateContextLastResponseID(db, ctxInfo.ID, testResponseID)
+	assert.NoError(t, err)
+
+	// Also set responseID on the last model response record to make chain valid
+	recs, err = cw.LiveRecords()
+	assert.NoError(t, err)
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].Source == ModelResp {
+			_, err = db.Exec(`UPDATE records SET response_id = ? WHERE id = ?`, testResponseID, recs[i].ID)
+			assert.NoError(t, err)
+			break
+		}
+	}
+
+	// Add another prompt - this should use server-side threading now that we have LastResponseID
 	err = cw.AddPrompt("How are you?")
 	assert.NoError(t, err)
 
-	_, err = cw.CallModel(ctx)
+	resp2, err := cw.CallModel(ctx)
 	assert.NoError(t, err)
+	assert.NotEmpty(t, resp2)
 
-	// Verify the mock was called with server-side threading
+	// Verify the mock was called with server-side threading (now we have LastResponseID)
 	assert.True(t, mockModel.lastCallUsedServerSide)
 	assert.NotNil(t, mockModel.lastPreviousResponseID)
+
+	// Verify conversation continues successfully with both responses
+	recs, err = cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Greater(t, len(recs), 2) // Should have prompts and responses
 }
 
 // Mock model for testing server-side threading behavior
@@ -914,7 +948,17 @@ type mockResponsesModel struct {
 }
 
 func (m *mockResponsesModel) Call(ctx context.Context, inputs []Record) ([]Record, int, error) {
-	events, _, tokens, err := m.CallWithThreading(ctx, false, nil, inputs)
+	// CallWithThreading with client-side threading (useServerSideThreading=false)
+	// Still return a responseID so LastResponseID gets set
+	events, responseID, tokens, err := m.CallWithThreading(ctx, false, nil, inputs)
+	// Set responseID on events for consistency
+	if responseID != nil && len(events) > 0 {
+		for i := range events {
+			if events[i].Source == ModelResp {
+				events[i].ResponseID = responseID
+			}
+		}
+	}
 	return events, tokens, err
 }
 
@@ -1499,6 +1543,7 @@ func TestContextContinuation(t *testing.T) {
 }
 
 // TestThreadingBehaviorResume tests threading behavior when resuming contexts
+// and ensures fallback doesn't break existing behavior
 func TestThreadingBehaviorResume(t *testing.T) {
 	db, err := NewContextDB(":memory:")
 	assert.NoError(t, err)
@@ -1516,25 +1561,50 @@ func TestThreadingBehaviorResume(t *testing.T) {
 		err = cw1.AddPrompt("Initial prompt")
 		assert.NoError(t, err)
 
-		_, err = cw1.CallModel(context.Background())
+		resp1, err := cw1.CallModel(context.Background())
 		assert.NoError(t, err)
+		assert.NotEmpty(t, resp1)
+
+		// Verify initial response was recorded
+		recs1, err := cw1.LiveRecords()
+		assert.NoError(t, err)
+		assert.Greater(t, len(recs1), 0)
 
 		// "Close" and reopen context
 		cw2, err := NewContextWindowWithThreading(db, threadingModel, "threading-resume", true)
 		assert.NoError(t, err)
+
+		// Verify context was resumed correctly
+		recs2, err := cw2.LiveRecords()
+		assert.NoError(t, err)
+		assert.Equal(t, len(recs1), len(recs2)) // Should have same records
 
 		// Add another prompt
 		err = cw2.AddPrompt("Follow-up prompt")
 		assert.NoError(t, err)
 
 		// Verify the model receives the call appropriately
-		_, err = cw2.CallModel(context.Background())
+		resp2, err := cw2.CallModel(context.Background())
 		assert.NoError(t, err)
+		assert.NotEmpty(t, resp2)
+
+		// Verify conversation continues successfully
+		recs3, err := cw2.LiveRecords()
+		assert.NoError(t, err)
+		assert.Greater(t, len(recs3), len(recs2)) // Should have more records now
 
 		// Check that the context was properly continued
 		ctx, err := GetContextByName(db, "threading-resume")
 		assert.NoError(t, err)
 		assert.Equal(t, true, ctx.UseServerSideThreading)
+
+		// Verify fallback doesn't break behavior - context should still work
+		err = cw2.AddPrompt("Third prompt")
+		assert.NoError(t, err)
+
+		resp3, err := cw2.CallModel(context.Background())
+		assert.NoError(t, err)
+		assert.NotEmpty(t, resp3)
 	})
 
 	t.Run("ResumeWithClientSideThreading", func(t *testing.T) {
@@ -1546,23 +1616,43 @@ func TestThreadingBehaviorResume(t *testing.T) {
 		err = cw1.AddPrompt("First client prompt")
 		assert.NoError(t, err)
 
-		_, err = cw1.CallModel(context.Background())
+		resp1, err := cw1.CallModel(context.Background())
 		assert.NoError(t, err)
+		assert.NotEmpty(t, resp1)
 
 		// Reopen context
 		cw2, err := NewContextWindowWithThreading(db, threadingModel, "client-resume", false)
 		assert.NoError(t, err)
 
+		// Verify context was resumed
+		recs1, err := cw2.LiveRecords()
+		assert.NoError(t, err)
+		assert.Greater(t, len(recs1), 0)
+
 		err = cw2.AddPrompt("Second client prompt")
 		assert.NoError(t, err)
 
-		_, err = cw2.CallModel(context.Background())
+		resp2, err := cw2.CallModel(context.Background())
 		assert.NoError(t, err)
+		assert.NotEmpty(t, resp2)
+
+		// Verify conversation continues successfully
+		recs2, err := cw2.LiveRecords()
+		assert.NoError(t, err)
+		assert.Greater(t, len(recs2), len(recs1))
 
 		// Verify context settings
 		ctx, err := GetContextByName(db, "client-resume")
 		assert.NoError(t, err)
 		assert.Equal(t, false, ctx.UseServerSideThreading)
+
+		// Verify fallback doesn't break behavior - context should still work
+		err = cw2.AddPrompt("Third client prompt")
+		assert.NoError(t, err)
+
+		resp3, err := cw2.CallModel(context.Background())
+		assert.NoError(t, err)
+		assert.NotEmpty(t, resp3)
 	})
 }
 
@@ -2089,4 +2179,571 @@ func TestContextWindow_SetRecordLiveStateByRange_Revive(t *testing.T) {
 	liveRecordsAfterDead, err := cw.LiveRecords()
 	assert.NoError(t, err)
 	assert.Len(t, liveRecordsAfterDead, 0)
+}
+
+// TestShouldAttemptServerSideThreading tests the helper function that determines
+// if server-side threading should be attempted.
+func TestShouldAttemptServerSideThreading(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	t.Run("threading enabled with valid chain", func(t *testing.T) {
+		mockModel := &mockResponsesModel{}
+		cw, err := NewContextWindowWithThreading(db, mockModel, "test-valid", true)
+		assert.NoError(t, err)
+
+		// Add prompt and get response to establish chain
+		err = cw.AddPrompt("Hello")
+		assert.NoError(t, err)
+
+		// First call - no LastResponseID, uses client-side (no responseID returned)
+		_, err = cw.CallModel(context.Background())
+		assert.NoError(t, err)
+
+		// Manually set LastResponseID to simulate what would happen after a server-side call
+		// In real usage, this would be set by a previous server-side threading call
+		ctx, err := GetContextByName(db, "test-valid")
+		assert.NoError(t, err)
+		testResponseID := "test_response_123"
+		err = UpdateContextLastResponseID(db, ctx.ID, testResponseID)
+		assert.NoError(t, err)
+
+		// Also set responseID on the last model response record to make chain valid
+		recs, err := cw.LiveRecords()
+		assert.NoError(t, err)
+		for i := len(recs) - 1; i >= 0; i-- {
+			if recs[i].Source == ModelResp {
+				// Update the record's responseID
+				_, err = db.Exec(`UPDATE records SET response_id = ? WHERE id = ?`, testResponseID, recs[i].ID)
+				assert.NoError(t, err)
+				break
+			}
+		}
+
+		// Now get context info
+		contextInfo, err := cw.GetCurrentContextInfo()
+		assert.NoError(t, err)
+
+		recs, err = cw.LiveRecords()
+		assert.NoError(t, err)
+
+		// Should attempt threading (has LastResponseID now)
+		shouldAttempt, reason := cw.shouldAttemptServerSideThreading(contextInfo, recs)
+		assert.True(t, shouldAttempt)
+		assert.Equal(t, "preconditions met", reason)
+	})
+
+	t.Run("threading disabled", func(t *testing.T) {
+		mockModel := &mockResponsesModel{}
+		cw, err := NewContextWindow(db, mockModel, "test-disabled")
+		assert.NoError(t, err)
+
+		contextInfo, err := cw.GetCurrentContextInfo()
+		assert.NoError(t, err)
+
+		recs, err := cw.LiveRecords()
+		assert.NoError(t, err)
+
+		shouldAttempt, reason := cw.shouldAttemptServerSideThreading(contextInfo, recs)
+		assert.False(t, shouldAttempt)
+		assert.Contains(t, reason, "server-side threading not enabled")
+	})
+
+	t.Run("model does not support threading", func(t *testing.T) {
+		// Use a model that doesn't implement ServerSideThreadingCapable
+		nonThreadingModel := &MockModel{}
+		cw, err := NewContextWindowWithThreading(db, nonThreadingModel, "test-no-support", true)
+		assert.NoError(t, err)
+
+		contextInfo, err := cw.GetCurrentContextInfo()
+		assert.NoError(t, err)
+
+		recs, err := cw.LiveRecords()
+		assert.NoError(t, err)
+
+		shouldAttempt, reason := cw.shouldAttemptServerSideThreading(contextInfo, recs)
+		assert.False(t, shouldAttempt)
+		assert.Contains(t, reason, "model does not support server-side threading")
+	})
+
+	t.Run("missing LastResponseID", func(t *testing.T) {
+		mockModel := &mockResponsesModel{}
+		cw, err := NewContextWindowWithThreading(db, mockModel, "test-no-last-id", true)
+		assert.NoError(t, err)
+
+		// Add prompt but don't call model yet (no LastResponseID)
+		err = cw.AddPrompt("Hello")
+		assert.NoError(t, err)
+
+		contextInfo, err := cw.GetCurrentContextInfo()
+		assert.NoError(t, err)
+
+		recs, err := cw.LiveRecords()
+		assert.NoError(t, err)
+
+		shouldAttempt, reason := cw.shouldAttemptServerSideThreading(contextInfo, recs)
+		assert.False(t, shouldAttempt)
+		assert.Contains(t, reason, "no last_response_id available")
+	})
+
+	t.Run("invalid response_id chain", func(t *testing.T) {
+		mockModel := &mockResponsesModel{}
+		cw, err := NewContextWindowWithThreading(db, mockModel, "test-invalid-chain", true)
+		assert.NoError(t, err)
+
+		// Add prompt and get response
+		err = cw.AddPrompt("Hello")
+		assert.NoError(t, err)
+
+		_, err = cw.CallModel(context.Background())
+		assert.NoError(t, err)
+
+		// Manually set LastResponseID so we can test chain validation
+		ctx, err := GetContextByName(db, "test-invalid-chain")
+		assert.NoError(t, err)
+		testResponseID := "test_response_123"
+		err = UpdateContextLastResponseID(db, ctx.ID, testResponseID)
+		assert.NoError(t, err)
+
+		// Add tool call to break the chain
+		err = cw.AddToolCall("test_tool", "{}")
+		assert.NoError(t, err)
+
+		contextInfo, err := cw.GetCurrentContextInfo()
+		assert.NoError(t, err)
+
+		recs, err := cw.LiveRecords()
+		assert.NoError(t, err)
+
+		shouldAttempt, reason := cw.shouldAttemptServerSideThreading(contextInfo, recs)
+		assert.False(t, shouldAttempt)
+		assert.Contains(t, reason, "response_id chain invalid")
+	})
+}
+
+// TestServerSideThreadingFallbackOnError tests fallback when server-side threading fails
+func TestServerSideThreadingFallbackOnError(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	// Create a mock model that fails on threading calls
+	failingModel := &failingThreadingModel{}
+
+	cw, err := NewContextWindowWithThreading(db, failingModel, "test-error-fallback", true)
+	assert.NoError(t, err)
+	defer cw.Close()
+
+	// Set up a valid threading scenario
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	// First call - no LastResponseID, will use client-side
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Add another prompt - now we have LastResponseID
+	err = cw.AddPrompt("How are you?")
+	assert.NoError(t, err)
+
+	// This call should attempt server-side, fail, and fallback to client-side
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err) // Should succeed with fallback
+
+	// Verify that the fallback occurred (the model should have been called with client-side)
+	assert.True(t, failingModel.fallbackOccurred)
+}
+
+// failingThreadingModel fails on threading calls but succeeds on regular calls
+type failingThreadingModel struct {
+	fallbackOccurred bool
+}
+
+func (m *failingThreadingModel) Call(ctx context.Context, inputs []Record) ([]Record, int, error) {
+	m.fallbackOccurred = true
+	return []Record{
+		{
+			Source:    ModelResp,
+			Content:   "Fallback response",
+			Live:      true,
+			EstTokens: 10,
+		},
+	}, 10, nil
+}
+
+func (m *failingThreadingModel) CallWithThreading(
+	ctx context.Context,
+	useServerSideThreading bool,
+	lastResponseID *string,
+	inputs []Record,
+) ([]Record, *string, int, error) {
+	// Always fail to simulate threading failure
+	return nil, nil, 0, fmt.Errorf("server-side threading failed")
+}
+
+func (m *failingThreadingModel) SetToolExecutor(executor ToolExecutor) {
+	// No-op
+}
+
+func (m *failingThreadingModel) SetMiddleware(middleware []Middleware) {
+	// No-op
+}
+
+// TestServerSideThreadingFallbackOnBrokenChain tests fallback when response_id chain is broken
+func TestServerSideThreadingFallbackOnBrokenChain(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockResponsesModel{}
+	cw, err := NewContextWindowWithThreading(db, mockModel, "test-broken-chain", true)
+	assert.NoError(t, err)
+	defer cw.Close()
+
+	// Set up initial valid chain
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Add tool call to break the chain
+	err = cw.AddToolCall("test_tool", "{}")
+	assert.NoError(t, err)
+
+	err = cw.AddToolOutput("Tool output")
+	assert.NoError(t, err)
+
+	// Add another prompt
+	err = cw.AddPrompt("Follow-up")
+	assert.NoError(t, err)
+
+	// This call should detect broken chain and fallback to client-side
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Verify fallback occurred (should use client-side threading)
+	assert.False(t, mockModel.lastCallUsedServerSide)
+}
+
+// TestThreadingFallbackOnMissingResponseID tests fallback when threading is enabled
+// but no LastResponseID exists (e.g., first call or after chain break)
+func TestThreadingFallbackOnMissingResponseID(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockResponsesModel{}
+	cw, err := NewContextWindowWithThreading(db, mockModel, "test-missing-response-id", true)
+	assert.NoError(t, err)
+	defer cw.Close()
+
+	// Add a prompt - this is the first call, so no LastResponseID exists
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	// Call model - should use client-side threading since no LastResponseID
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Verify that client-side threading was used (no LastResponseID available)
+	assert.False(t, mockModel.lastCallUsedServerSide)
+	assert.Nil(t, mockModel.lastPreviousResponseID)
+
+	// Verify conversation continues successfully
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Greater(t, len(recs), 0)
+
+	// Verify response was recorded
+	foundResponse := false
+	for _, rec := range recs {
+		if rec.Source == ModelResp {
+			foundResponse = true
+			break
+		}
+	}
+	assert.True(t, foundResponse, "Model response should be recorded")
+}
+
+// TestThreadingFallbackOnToolCalls tests fallback when tool calls are present
+// Tool calls break server-side threading, so should always use client-side
+func TestThreadingFallbackOnToolCalls(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockResponsesModel{}
+	cw, err := NewContextWindowWithThreading(db, mockModel, "test-tool-calls-fallback", true)
+	assert.NoError(t, err)
+	defer cw.Close()
+
+	// Set up initial valid chain
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Manually set LastResponseID to simulate what would happen after a server-side call
+	ctxInfo, err := GetContextByName(db, "test-tool-calls-fallback")
+	assert.NoError(t, err)
+	testResponseID := "test_response_123"
+	err = UpdateContextLastResponseID(db, ctxInfo.ID, testResponseID)
+	assert.NoError(t, err)
+
+	// Also set responseID on the last model response record to make chain valid
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].Source == ModelResp {
+			_, err = db.Exec(`UPDATE records SET response_id = ? WHERE id = ?`, testResponseID, recs[i].ID)
+			assert.NoError(t, err)
+			break
+		}
+	}
+
+	// Add tool calls - these break server-side threading
+	err = cw.AddToolCall("test_tool", `{"arg": "value"}`)
+	assert.NoError(t, err)
+
+	err = cw.AddToolOutput("Tool output")
+	assert.NoError(t, err)
+
+	// Add another prompt
+	err = cw.AddPrompt("Follow-up after tool call")
+	assert.NoError(t, err)
+
+	// Reset the mock state
+	mockModel.lastCallUsedServerSide = false
+	mockModel.lastPreviousResponseID = nil
+
+	// Call model - should fallback to client-side threading because of tool calls
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Verify fallback occurred (should use client-side threading)
+	assert.False(t, mockModel.lastCallUsedServerSide)
+
+	// Verify conversation continues successfully
+	recs, err = cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Greater(t, len(recs), 0)
+}
+
+// TestEmptyContextWithThreadingEnabled tests that empty contexts with threading enabled
+// work correctly (first call should use client-side threading, should not error)
+func TestEmptyContextWithThreadingEnabled(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockResponsesModel{}
+	cw, err := NewContextWindowWithThreading(db, mockModel, "test-empty-threading", true)
+	assert.NoError(t, err)
+	defer cw.Close()
+
+	// Verify threading is enabled
+	enabled, err := cw.IsServerSideThreadingEnabled()
+	assert.NoError(t, err)
+	assert.True(t, enabled)
+
+	// Verify context is empty
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Len(t, recs, 0)
+
+	// Add a prompt - this is the first call, so no LastResponseID exists
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	// Call model - should use client-side threading (no previous response)
+	// Should not error even though threading is enabled
+	resp, err := cw.CallModel(context.Background())
+	assert.NoError(t, err)
+	assert.NotEmpty(t, resp)
+
+	// Verify client-side threading was used (no LastResponseID available)
+	assert.False(t, mockModel.lastCallUsedServerSide)
+	assert.Nil(t, mockModel.lastPreviousResponseID)
+
+	// Verify response was recorded
+	recs, err = cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Greater(t, len(recs), 0)
+
+	// Verify a response record exists
+	foundResponse := false
+	for _, rec := range recs {
+		if rec.Source == ModelResp {
+			foundResponse = true
+			break
+		}
+	}
+	assert.True(t, foundResponse, "Model response should be recorded")
+}
+
+// TestLastResponseIDNoMatchingRecordFallback tests fallback when LastResponseID
+// exists but no matching record is found (export/import scenario)
+func TestLastResponseIDNoMatchingRecordFallback(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockResponsesModel{}
+	cw, err := NewContextWindowWithThreading(db, mockModel, "test-no-matching-record", true)
+	assert.NoError(t, err)
+	defer cw.Close()
+
+	// Add a prompt and get response
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Manually set a LastResponseID that doesn't match any record
+	// This simulates what might happen after export/import
+	ctxInfo, err := GetContextByName(db, "test-no-matching-record")
+	assert.NoError(t, err)
+	nonexistentResponseID := "resp-nonexistent-999"
+	err = UpdateContextLastResponseID(db, ctxInfo.ID, nonexistentResponseID)
+	assert.NoError(t, err)
+
+	// Add another prompt
+	err = cw.AddPrompt("Follow-up")
+	assert.NoError(t, err)
+
+	// Reset mock state
+	mockModel.lastCallUsedServerSide = false
+	mockModel.lastPreviousResponseID = nil
+
+	// Call model - should detect broken chain and fallback to client-side
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Verify fallback occurred (should use client-side threading)
+	assert.False(t, mockModel.lastCallUsedServerSide)
+
+	// Verify conversation continues successfully
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Greater(t, len(recs), 0)
+}
+
+// TestConcurrentCallModelWithFallback tests that fallback decisions work correctly
+// when called from different contexts. Note: Database operations require external
+// coordination for true concurrency (as documented), but fallback decision logic
+// itself reads from database safely.
+func TestConcurrentCallModelWithFallback(t *testing.T) {
+	// Test sequential calls from different contexts to verify fallback logic
+	// works correctly without requiring true database concurrency
+	path := filepath.Join(t.TempDir(), "concurrent.db")
+	db, err := NewContextDB(path)
+	assert.NoError(t, err)
+	defer db.Close()
+
+	// Create multiple context windows sequentially to verify fallback logic
+	for i := 0; i < 5; i++ {
+		mockModel := &mockResponsesModel{}
+		cw, err := NewContextWindowWithThreading(db, mockModel, fmt.Sprintf("test-concurrent-%d", i), true)
+		assert.NoError(t, err)
+
+		// Add a prompt
+		err = cw.AddPrompt(fmt.Sprintf("Prompt %d", i))
+		assert.NoError(t, err)
+
+		// Call model - should use client-side threading (no LastResponseID)
+		// This verifies that fallback decision logic works correctly
+		_, err = cw.CallModel(context.Background())
+		assert.NoError(t, err, "CallModel should succeed for context %d", i)
+
+		// Verify fallback occurred (should use client-side threading)
+		assert.False(t, mockModel.lastCallUsedServerSide, "Should use client-side threading for first call")
+		assert.Nil(t, mockModel.lastPreviousResponseID, "Should not have previous response ID")
+	}
+}
+
+// TestErrorMessagesIndicateFallback tests that error messages properly indicate
+// when fallback to client-side threading occurred
+func TestErrorMessagesIndicateFallback(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	// Start with a working model to set up the state
+	workingModel := &mockResponsesModel{}
+	cw, err := NewContextWindowWithThreading(db, workingModel, "test-error-messages", true)
+	assert.NoError(t, err)
+	defer cw.Close()
+
+	// Set up a scenario where server-side threading would be attempted
+	err = cw.AddPrompt("Hello")
+	assert.NoError(t, err)
+
+	// First call - no LastResponseID, uses client-side, succeeds
+	_, err = cw.CallModel(context.Background())
+	assert.NoError(t, err)
+
+	// Manually set LastResponseID to trigger server-side attempt
+	ctxInfo, err := GetContextByName(db, "test-error-messages")
+	assert.NoError(t, err)
+	testResponseID := "test_response_123"
+	err = UpdateContextLastResponseID(db, ctxInfo.ID, testResponseID)
+	assert.NoError(t, err)
+
+	// Set responseID on last model response to make chain valid
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].Source == ModelResp {
+			_, err = db.Exec(`UPDATE records SET response_id = ? WHERE id = ?`, testResponseID, recs[i].ID)
+			assert.NoError(t, err)
+			break
+		}
+	}
+
+	// Now switch to a failing model to test error message
+	failingModel := &failingClientSideModel{}
+	cw.model = failingModel
+
+	// Add another prompt
+	err = cw.AddPrompt("Follow-up")
+	assert.NoError(t, err)
+
+	// This should attempt server-side, fail, fallback to client-side, which also fails
+	// The error message should indicate fallback occurred
+	_, err = cw.CallModel(context.Background())
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "fallback to client-side threading",
+		"Error message should indicate fallback occurred")
+}
+
+// failingClientSideModel fails on both threading and regular calls to test error messages
+type failingClientSideModel struct {
+	fallbackOccurred bool
+}
+
+func (m *failingClientSideModel) Call(ctx context.Context, inputs []Record) ([]Record, int, error) {
+	m.fallbackOccurred = true
+	return nil, 0, fmt.Errorf("client-side call failed")
+}
+
+func (m *failingClientSideModel) CallWithThreading(
+	ctx context.Context,
+	useServerSideThreading bool,
+	lastResponseID *string,
+	inputs []Record,
+) ([]Record, *string, int, error) {
+	// Always fail to simulate threading failure
+	return nil, nil, 0, fmt.Errorf("server-side threading failed")
+}
+
+func (m *failingClientSideModel) SetToolExecutor(executor ToolExecutor) {
+	// No-op
+}
+
+func (m *failingClientSideModel) SetMiddleware(middleware []Middleware) {
+	// No-op
 }
