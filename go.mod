@@ -3,6 +3,7 @@ module github.com/superfly/contextwindow
 go 1.24.2
 
 require (
+	github.com/anthropics/anthropic-sdk-go v1.15.0
 	github.com/google/uuid v1.6.0
 	github.com/openai/openai-go/v2 v2.0.2
 	github.com/peterheb/gotoken v0.9.1
@@ -11,7 +12,6 @@ require (
 )
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.15.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
