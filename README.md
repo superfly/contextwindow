@@ -24,8 +24,8 @@ import (
 func main() {
 	ctx := context.Background()
 
-        // reads OPENAI_API_KEY
-        model, err := NewOpenAIResponsesModel(shared.ResponsesModel4o)
+	// reads OPENAI_API_KEY
+	model, err := NewOpenAIResponsesModel(shared.ResponsesModel4o)
 	if err != nil {
 		log.Fatalf("Failed to create model: %v", err)
 	}
@@ -39,8 +39,7 @@ func main() {
 	}
 	defer cw.Close()
 
-        if err := cw.AddPrompt(ctx, "how's the weather over there?")
-	if err := cw.AddPrompt(ctx, prompt); err != nil {
+	if err := cw.AddPrompt(ctx, "how's the weather over there?"); err != nil {
 		log.Fatalf("Failed to add prompt: %v", err)
 	}
 
