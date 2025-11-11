@@ -675,21 +675,27 @@ func CloneContext(db *sql.DB, sourceName, destName string) error {
 }
 
 // ValidateResponseIDChain checks if a response_id chain is valid for server-side threading.
-// Returns true if the chain is valid, false otherwise, along with a reason.
-func ValidateResponseIDChain(db *sql.DB, contextID string) (bool, string) {
-	// Get context to check LastResponseID
-	ctx, err := GetContext(db, contextID)
-	if err != nil {
-		return false, fmt.Sprintf("cannot get context: %v", err)
-	}
+func ValidateResponseIDChain(db *sql.DB, ctx Context) (valid bool, reason string) {
+	var (
+		err     error
+		isValid = func(id *string) bool {
+			return id != nil && *id != ""
+		}
+	)
 
 	// If no LastResponseID, chain is invalid
-	if ctx.LastResponseID == nil || *ctx.LastResponseID == "" {
+	if !isValid(ctx.LastResponseID) {
+		ctx, err = GetContext(db, ctx.ID)
+		if err != nil {
+			return false, "can't load context from db"
+		}
+	}
+
+	if !isValid(ctx.LastResponseID) {
 		return false, "no last_response_id set"
 	}
 
-	// Get all live records
-	records, err := ListLiveRecords(db, contextID)
+	records, err := ListLiveRecords(db, ctx.ID)
 	if err != nil {
 		return false, fmt.Sprintf("cannot list records: %v", err)
 	}
@@ -701,7 +707,6 @@ func ValidateResponseIDChain(db *sql.DB, contextID string) (bool, string) {
 		}
 	}
 
-	// Find all ModelResp records
 	var modelResponses []Record
 	for _, rec := range records {
 		if rec.Source == ModelResp {
@@ -715,12 +720,14 @@ func ValidateResponseIDChain(db *sql.DB, contextID string) (bool, string) {
 	}
 
 	// Check for gaps in response_id chain
-	hasResponseIDs := false
-	hasMissingResponseIDs := false
-	lastResponseIDExists := false
+	var (
+		hasResponseIDs        = false
+		hasMissingResponseIDs = false
+		lastResponseIDExists  = false
+	)
 
 	for _, rec := range modelResponses {
-		if rec.ResponseID != nil && *rec.ResponseID != "" {
+		if isValid(rec.ResponseID) {
 			hasResponseIDs = true
 			// Check if this matches the context's LastResponseID (for existence check)
 			if ctx.LastResponseID != nil && *rec.ResponseID == *ctx.LastResponseID {
@@ -733,12 +740,11 @@ func ValidateResponseIDChain(db *sql.DB, contextID string) (bool, string) {
 
 	// Edge case: Context has LastResponseID but no matching record exists
 	// This can happen after export/import or manual database edits
-	if ctx.LastResponseID != nil && *ctx.LastResponseID != "" && !lastResponseIDExists {
+	if isValid(ctx.LastResponseID) && !lastResponseIDExists {
 		return false, fmt.Sprintf("last_response_id (%v) does not exist in records (chain broken, possibly after export/import)",
 			*ctx.LastResponseID)
 	}
 
-	// Mixed state is invalid
 	if hasResponseIDs && hasMissingResponseIDs {
 		return false, "mixed response_id state (some records missing IDs)"
 	}

@@ -4,27 +4,27 @@
 //
 // # Abbreviated usage
 //
-//           model, err := NewOpenAIResponsesModel(shared.ResponsesModel4o)
-//           if err != nil {
-//             log.Fatalf("Failed to create model: %v", err)
-//           }
+//	          model, err := NewOpenAIResponsesModel(shared.ResponsesModel4o)
+//	          if err != nil {
+//	            log.Fatalf("Failed to create model: %v", err)
+//	          }
 //
-//	     cw, err := contextwindow.New(model, nil, "")
-//	     if err != nil {
-//             log.Fatalf("Failed to create context window: %v", err)
-//	     }
-//	     defer cw.Close()
+//		     cw, err := contextwindow.New(model, nil, "")
+//		     if err != nil {
+//	            log.Fatalf("Failed to create context window: %v", err)
+//		     }
+//		     defer cw.Close()
 //
-//	     if err := cw.AddPrompt(ctx, "how's the weather?"); err != nil {
-//             log.Fatalf("Failed to add prompt: %v", err)
-//           }
+//		     if err := cw.AddPrompt(ctx, "how's the weather?"); err != nil {
+//	            log.Fatalf("Failed to add prompt: %v", err)
+//	          }
 //
-//	     response, err := cw.CallModel(ctx)
-//           if err != nil {
-//             log.Fatalf("Failed to call model: %v", err)
-//	     }
+//		     response, err := cw.CallModel(ctx)
+//	          if err != nil {
+//	            log.Fatalf("Failed to call model: %v", err)
+//		     }
 //
-//	     fmt.Printf("response: %s\n", response)
+//		     fmt.Printf("response: %s\n", response)
 //
 // # System prompts
 //
@@ -35,19 +35,19 @@
 //
 // Instruct LLMs to call tools locally with [ContextWindow.AddTool] (and [NewTool]).
 //
-//	    lsTool := contextwindow.NewTool("list_files", `
-//	        This tool lists files in the specified directory.
-//	    `).AddStringParameter("directory", "Directory to list", true)
+//		    lsTool := contextwindow.NewTool("list_files", `
+//		        This tool lists files in the specified directory.
+//		    `).AddStringParameter("directory", "Directory to list", true)
 //
-//	    cw.AddTool(lsTool, contextwindow.ToolRunnerFunc(func context.Context,
-//	                                                    args json.RawMessage) (string, error) {
-//	    var treq struct {
-//           Dir string `json:"directory"`
-//          }
-//	    json.Unmarshal(args, &treq)
-//	      // actually run ls, or pretend to
-//	      return "here\nare\nsome\nfiles.exe\n", nil
-//	    })
+//		    cw.AddTool(lsTool, contextwindow.ToolRunnerFunc(func context.Context,
+//		                                                    args json.RawMessage) (string, error) {
+//		    var treq struct {
+//	          Dir string `json:"directory"`
+//	         }
+//		    json.Unmarshal(args, &treq)
+//		      // actually run ls, or pretend to
+//		      return "here\nare\nsome\nfiles.exe\n", nil
+//		    })
 //
 // You can selectively enable and disable tools with [ContextWindow.CallModelWithOpts].
 //
@@ -62,12 +62,12 @@
 //
 // You can provide a summarizer model to automatically compact your context window:
 //
-//	    summarizerModel, err := openai.New(apiKey, "gpt-3.5-turbo")
-//	    if err != nil {
-//           log.Fatalf("Failed to create summarizer: %v", err)
-//	    }
+//		    summarizerModel, err := openai.New(apiKey, "gpt-3.5-turbo")
+//		    if err != nil {
+//	          log.Fatalf("Failed to create summarizer: %v", err)
+//		    }
 //
-//	    cw, err := contextwindow.New(model, summarizerModel, "")
+//		    cw, err := contextwindow.New(model, summarizerModel, "")
 //
 // And then "compress" your context with [ContextWindow.SummarizeLiveContent].
 //
@@ -118,7 +118,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -433,53 +432,30 @@ func (cw *ContextWindow) CallModel(ctx context.Context) (string, error) {
 	return cw.CallModelWithOpts(ctx, CallModelOpts{})
 }
 
-// shouldAttemptServerSideThreading determines if server-side threading should be attempted.
-// Returns: (shouldAttempt bool, reason string)
 func (cw *ContextWindow) shouldAttemptServerSideThreading(
-	contextInfo Context,
+	ci Context,
 	recs []Record,
-) (bool, string) {
-	// If threading not enabled, don't attempt
-	if !contextInfo.UseServerSideThreading {
+) (should bool, reason string /* not using this yet but seems like a good idea */) {
+
+	if !ci.UseServerSideThreading {
 		return false, "server-side threading not enabled for context"
 	}
 
-	// Check if model supports threading
 	_, ok := cw.model.(ServerSideThreadingCapable)
 	if !ok {
 		return false, "model does not support server-side threading"
 	}
 
-	// Check if there's a LastResponseID (needed for threading)
-	if contextInfo.LastResponseID == nil || *contextInfo.LastResponseID == "" {
+	if ci.LastResponseID == nil || *ci.LastResponseID == "" {
 		return false, "no last_response_id available (first call or chain broken)"
 	}
 
-	// Validate response_id chain
-	contextID, err := getContextIDByName(cw.db, cw.currentContext)
-	if err != nil {
-		return false, fmt.Sprintf("cannot get context ID: %v", err)
-	}
-
-	valid, reason := ValidateResponseIDChain(cw.db, contextID)
+	valid, reason := ValidateResponseIDChain(cw.db, ci)
 	if !valid {
 		return false, fmt.Sprintf("response_id chain invalid: %s", reason)
 	}
 
 	return true, "preconditions met"
-}
-
-// logThreadingDecision logs threading decisions for observability
-func (cw *ContextWindow) logThreadingDecision(
-	attemptServerSide bool,
-	reason string,
-	contextName string,
-) {
-	slog.Info("threading decision",
-		"attempt_server_side", attemptServerSide,
-		"reason", reason,
-		"context", contextName,
-	)
 }
 
 // CallModelWithOpts drives an LLM with options. It composes live messages, invokes cw.model.Call,
@@ -501,19 +477,15 @@ func (cw *ContextWindow) CallModelWithOpts(ctx context.Context, opts CallModelOp
 		return "", fmt.Errorf("list live records: %w", err)
 	}
 
-	var events []Record
-	var tokensUsed int
-	var responseID *string
+	var (
+		events     []Record
+		tokensUsed int
+		responseID *string
+	)
 
-	// Determine if we should attempt server-side threading
-	attemptServerSide, reason := cw.shouldAttemptServerSideThreading(contextInfo, recs)
-	loggedFallback := false
+	attemptServerSide, _ := cw.shouldAttemptServerSideThreading(contextInfo, recs)
 
 	if attemptServerSide {
-		// Log threading attempt
-		cw.logThreadingDecision(true, reason, cw.currentContext)
-
-		// Attempt server-side threading
 		threadingModel := cw.model.(ServerSideThreadingCapable)
 		var err error
 
@@ -535,30 +507,19 @@ func (cw *ContextWindow) CallModelWithOpts(ctx context.Context, opts CallModelOp
 		}
 
 		if err != nil {
-			// Log fallback reason
-			fallbackReason := fmt.Sprintf("server-side threading failed: %v", err)
-			cw.logThreadingDecision(false, fallbackReason, cw.currentContext)
-			loggedFallback = true
 			// Fall through to client-side threading
 			attemptServerSide = false
-			reason = fallbackReason
 		}
 	}
 
 	// Use client-side threading (either as fallback or default)
 	if !attemptServerSide {
-		// Log reason for client-side threading (only if we didn't already log the fallback)
-		if !loggedFallback {
-			cw.logThreadingDecision(false, reason, cw.currentContext)
-		}
-
 		if optsModel, ok := cw.model.(CallOptsCapable); ok {
 			events, tokensUsed, err = optsModel.CallWithOpts(ctx, recs, opts)
 		} else {
 			events, tokensUsed, err = cw.model.Call(ctx, recs)
 		}
 		if err != nil {
-			// Include fallback context in error message if we fell back from server-side
 			if contextInfo.UseServerSideThreading {
 				return "", fmt.Errorf("call model (fallback to client-side threading): %w", err)
 			}
@@ -585,7 +546,6 @@ func (cw *ContextWindow) CallModelWithOpts(ctx context.Context, opts CallModelOp
 		lastMsg = event.Content
 	}
 
-	// Update the context's last response ID if we got one
 	if responseID != nil {
 		err = UpdateContextLastResponseID(cw.db, contextID, *responseID)
 		if err != nil {
