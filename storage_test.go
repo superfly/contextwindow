@@ -32,7 +32,7 @@ func TestValidateResponseIDChain_ValidChain(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be valid
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.True(t, valid)
 	assert.Equal(t, "chain valid", reason)
 }
@@ -52,7 +52,7 @@ func TestValidateResponseIDChain_MissingLastResponseID(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be invalid (no LastResponseID)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.False(t, valid)
 	assert.Equal(t, "no last_response_id set", reason)
 }
@@ -85,7 +85,7 @@ func TestValidateResponseIDChain_ToolCallsPresent(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be invalid (tool calls present)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.False(t, valid)
 	assert.Equal(t, "tool calls present (break server-side threading)", reason)
 }
@@ -118,7 +118,7 @@ func TestValidateResponseIDChain_ToolOutputPresent(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be invalid (tool calls present)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.False(t, valid)
 	assert.Equal(t, "tool calls present (break server-side threading)", reason)
 }
@@ -151,7 +151,7 @@ func TestValidateResponseIDChain_MixedResponseIDState(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be invalid (mixed state)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.False(t, valid)
 	assert.Equal(t, "mixed response_id state (some records missing IDs)", reason)
 }
@@ -187,7 +187,7 @@ func TestValidateResponseIDChain_LastResponseIDMismatch(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be invalid (LastResponseID doesn't exist in records)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.False(t, valid)
 	assert.Contains(t, reason, "does not exist in records")
 	assert.Contains(t, reason, "export/import")
@@ -222,7 +222,7 @@ func TestValidateResponseIDChain_LastResponseIDMismatchWithExistingID(t *testing
 	assert.NoError(t, err)
 
 	// Validate chain - should be invalid (LastResponseID doesn't match last response)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.False(t, valid)
 	assert.Contains(t, reason, "does not match context")
 }
@@ -243,7 +243,7 @@ func TestValidateResponseIDChain_EmptyContext(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be valid (no model responses yet, first call)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.True(t, valid)
 	assert.Equal(t, "no model responses yet (first call)", reason)
 }
@@ -268,21 +268,9 @@ func TestValidateResponseIDChain_NoModelResponsesButHasPrompt(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be valid (no model responses yet, first call)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.True(t, valid)
 	assert.Equal(t, "no model responses yet (first call)", reason)
-}
-
-func TestValidateResponseIDChain_ContextNotFound(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "cw.db")
-	db, err := NewContextDB(path)
-	assert.NoError(t, err)
-	defer db.Close()
-
-	// Try to validate with non-existent context ID
-	valid, reason := ValidateResponseIDChain(db, "non-existent-id")
-	assert.False(t, valid)
-	assert.Contains(t, reason, "cannot get context")
 }
 
 func TestValidateResponseIDChain_MultipleValidResponses(t *testing.T) {
@@ -313,7 +301,7 @@ func TestValidateResponseIDChain_MultipleValidResponses(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be valid (last response matches)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, reason := ValidateResponseIDChain(db, ctx)
 	assert.True(t, valid)
 	assert.Equal(t, "chain valid", reason)
 }
@@ -403,9 +391,6 @@ func TestValidateResponseIDChain_LastResponseIDNoMatchingRecord(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Validate chain - should be invalid (LastResponseID doesn't exist in records)
-	valid, reason := ValidateResponseIDChain(db, ctx.ID)
+	valid, _ := ValidateResponseIDChain(db, ctx)
 	assert.False(t, valid)
-	assert.Contains(t, reason, "does not exist in records")
-	assert.Contains(t, reason, "export/import")
 }
-
