@@ -3,6 +3,7 @@ package contextwindow
 import (
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/openai/openai-go/v2"
+	"google.golang.org/genai"
 )
 
 type ParameterType string
@@ -197,6 +198,64 @@ func (tb *ToolBuilder) parameterToClaudeSchema(param *Parameter) map[string]inte
 			if len(required) > 0 {
 				schema["required"] = required
 			}
+		}
+	}
+
+	return schema
+}
+
+func (tb *ToolBuilder) ToGemini() *genai.FunctionDeclaration {
+	properties := make(map[string]*genai.Schema)
+	var required []string
+
+	for _, p := range tb.parameters {
+		properties[p.Name] = tb.parameterToGeminiSchema(p)
+		if p.Required {
+			required = append(required, p.Name)
+		}
+	}
+
+	return &genai.FunctionDeclaration{
+		Name:        tb.name,
+		Description: tb.description,
+		Parameters: &genai.Schema{
+			Type:       genai.TypeObject,
+			Properties: properties,
+			Required:   required,
+		},
+	}
+}
+
+func (tb *ToolBuilder) parameterToGeminiSchema(param *Parameter) *genai.Schema {
+	schema := &genai.Schema{
+		Description: param.Description,
+	}
+
+	switch param.Type {
+	case ParameterTypeString:
+		schema.Type = genai.TypeString
+	case ParameterTypeNumber:
+		schema.Type = genai.TypeNumber
+	case ParameterTypeBoolean:
+		schema.Type = genai.TypeBoolean
+	case ParameterTypeArray:
+		schema.Type = genai.TypeArray
+		if param.Items != nil {
+			schema.Items = tb.parameterToGeminiSchema(param.Items)
+		}
+	case ParameterTypeObject:
+		schema.Type = genai.TypeObject
+		if param.Properties != nil {
+			properties := make(map[string]*genai.Schema)
+			var required []string
+			for name, prop := range param.Properties {
+				properties[name] = tb.parameterToGeminiSchema(prop)
+				if prop.Required {
+					required = append(required, name)
+				}
+			}
+			schema.Properties = properties
+			schema.Required = required
 		}
 	}
 

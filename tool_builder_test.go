@@ -255,3 +255,136 @@ func TestContextWindowAddToolFromJSON(t *testing.T) {
 	assert.True(t, exists)
 	assert.NotNil(t, registeredRunner)
 }
+
+func TestToGemini(t *testing.T) {
+	tool := NewTool("example_tool", "An example tool for testing").
+		AddStringParameter("query", "Search query", true).
+		AddNumberParameter("limit", "Result limit", false).
+		AddBooleanParameter("verbose", "Verbose output", false)
+
+	geminiDef := tool.ToGemini()
+
+	assert.Equal(t, "example_tool", geminiDef.Name)
+	assert.Equal(t, "An example tool for testing", geminiDef.Description)
+
+	// Check the schema structure
+	assert.NotNil(t, geminiDef.Parameters)
+	assert.Equal(t, "OBJECT", string(geminiDef.Parameters.Type))
+
+	// Check properties
+	assert.Contains(t, geminiDef.Parameters.Properties, "query")
+	assert.Contains(t, geminiDef.Parameters.Properties, "limit")
+	assert.Contains(t, geminiDef.Parameters.Properties, "verbose")
+
+	queryProp := geminiDef.Parameters.Properties["query"]
+	assert.Equal(t, "STRING", string(queryProp.Type))
+	assert.Equal(t, "Search query", queryProp.Description)
+
+	limitProp := geminiDef.Parameters.Properties["limit"]
+	assert.Equal(t, "NUMBER", string(limitProp.Type))
+	assert.Equal(t, "Result limit", limitProp.Description)
+
+	verboseProp := geminiDef.Parameters.Properties["verbose"]
+	assert.Equal(t, "BOOLEAN", string(verboseProp.Type))
+	assert.Equal(t, "Verbose output", verboseProp.Description)
+
+	// Check required fields
+	assert.Contains(t, geminiDef.Parameters.Required, "query")
+	assert.NotContains(t, geminiDef.Parameters.Required, "limit")
+	assert.NotContains(t, geminiDef.Parameters.Required, "verbose")
+}
+
+func TestToGeminiWithArray(t *testing.T) {
+	tool := NewTool("array_tool", "Tool with array parameter").
+		AddArrayParameter("tags", "List of tags", true, ParameterTypeString)
+
+	geminiDef := tool.ToGemini()
+
+	tagsProp := geminiDef.Parameters.Properties["tags"]
+	assert.Equal(t, "ARRAY", string(tagsProp.Type))
+	assert.Equal(t, "List of tags", tagsProp.Description)
+
+	// Check items
+	assert.NotNil(t, tagsProp.Items)
+	assert.Equal(t, "STRING", string(tagsProp.Items.Type))
+}
+
+func TestToGeminiWithObject(t *testing.T) {
+	properties := map[string]*Parameter{
+		"name": {
+			Type:        ParameterTypeString,
+			Description: "Person's name",
+			Required:    true,
+		},
+		"age": {
+			Type:        ParameterTypeNumber,
+			Description: "Person's age",
+			Required:    false,
+		},
+	}
+
+	tool := NewTool("object_tool", "Tool with object parameter").
+		AddObjectParameter("person", "Person information", true, properties)
+
+	geminiDef := tool.ToGemini()
+	personProp := geminiDef.Parameters.Properties["person"]
+
+	assert.Equal(t, "OBJECT", string(personProp.Type))
+	assert.Equal(t, "Person information", personProp.Description)
+
+	// Check nested properties
+	assert.Contains(t, personProp.Properties, "name")
+	assert.Contains(t, personProp.Properties, "age")
+
+	nameProp := personProp.Properties["name"]
+	assert.Equal(t, "STRING", string(nameProp.Type))
+	assert.Equal(t, "Person's name", nameProp.Description)
+
+	ageProp := personProp.Properties["age"]
+	assert.Equal(t, "NUMBER", string(ageProp.Type))
+	assert.Equal(t, "Person's age", ageProp.Description)
+
+	// Check nested required fields
+	assert.Contains(t, personProp.Required, "name")
+	assert.NotContains(t, personProp.Required, "age")
+}
+
+func TestToGeminiWithNestedArrayAndObject(t *testing.T) {
+	// Create a complex nested structure
+	addressProps := map[string]*Parameter{
+		"street": {
+			Type:        ParameterTypeString,
+			Description: "Street address",
+			Required:    true,
+		},
+		"city": {
+			Type:        ParameterTypeString,
+			Description: "City name",
+			Required:    true,
+		},
+	}
+
+	tool := NewTool("complex_tool", "Tool with complex nested parameters").
+		AddObjectParameter("address", "Address information", true, addressProps).
+		AddArrayParameter("tags", "List of tags", false, ParameterTypeString)
+
+	geminiDef := tool.ToGemini()
+
+	// Check address object
+	addressProp := geminiDef.Parameters.Properties["address"]
+	assert.Equal(t, "OBJECT", string(addressProp.Type))
+	assert.Contains(t, addressProp.Properties, "street")
+	assert.Contains(t, addressProp.Properties, "city")
+	assert.Contains(t, addressProp.Required, "street")
+	assert.Contains(t, addressProp.Required, "city")
+
+	// Check tags array
+	tagsProp := geminiDef.Parameters.Properties["tags"]
+	assert.Equal(t, "ARRAY", string(tagsProp.Type))
+	assert.NotNil(t, tagsProp.Items)
+	assert.Equal(t, "STRING", string(tagsProp.Items.Type))
+
+	// Check top-level required
+	assert.Contains(t, geminiDef.Parameters.Required, "address")
+	assert.NotContains(t, geminiDef.Parameters.Required, "tags")
+}
