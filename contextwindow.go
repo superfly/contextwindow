@@ -55,6 +55,34 @@
 // (the example up there is way too simple). Treat descriptions like part of the system
 // prompt; tell the agent what to do.
 //
+// # Streaming
+//
+// Use [ContextWindow.CallModelStreaming] or [ContextWindow.CallModelStreamingWithOpts] to
+// receive tokens as they arrive from the LLM provider:
+//
+//	callback := func(chunk StreamChunk) error {
+//	    if !chunk.Done {
+//	        fmt.Print(chunk.Delta)
+//	    }
+//	    return nil
+//	}
+//
+//	response, err := cw.CallModelStreaming(ctx, callback)
+//
+// The [StreamChunk] structure contains:
+//   - Delta: incremental text/token content
+//   - Done: whether the stream has completed
+//   - Metadata: provider-specific metadata (optional)
+//   - Error: any streaming error that occurred
+//
+// If your callback returns a non-nil error, streaming will be stopped immediately,
+// allowing you to implement early cancellation. The complete response is persisted
+// after streaming completes, maintaining the same database consistency as non-streaming calls.
+//
+// If the model doesn't support streaming (doesn't implement [StreamingCapable] or
+// [StreamingOptsCapable]), the method automatically falls back to [ContextWindow.CallModel],
+// ensuring backward compatibility.
+//
 // # Summarization
 //
 // Models have context token limits (we use [github.com/peterheb/gotoken/cl100kbase] to
@@ -111,6 +139,13 @@
 //
 // ContextReader provides access to read operations like LiveRecords(), TokenUsage(),
 // and context querying, all of which are safe for concurrent use.
+//
+// Streaming operations (CallModelStreaming, CallModelStreamingWithOpts) are safe
+// for concurrent use. Multiple goroutines can stream simultaneously, with each stream
+// operating independently. The streaming phase (token delivery) is non-blocking,
+// and database writes are protected by internal synchronization to ensure atomicity
+// when multiple streams complete simultaneously. User-provided callbacks should be
+// thread-safe if they access shared state.
 package contextwindow
 
 import (
@@ -118,8 +153,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -171,12 +209,58 @@ type CallOptsCapable interface {
 	) (events []Record, responseID *string, tokensUsed int, err error)
 }
 
+// StreamChunk represents a single chunk of data from a streaming LLM response.
+type StreamChunk struct {
+	// Delta is the incremental text/token content for this chunk.
+	Delta string
+	// Done indicates whether the stream has completed.
+	Done bool
+	// Metadata contains provider-specific metadata for this chunk.
+	Metadata map[string]any
+	// Error contains any streaming error that occurred.
+	Error error
+}
+
+// StreamCallback is a function type for handling streaming chunks.
+// It receives a StreamChunk and returns an error to allow early cancellation.
+// If the callback returns a non-nil error, streaming should be stopped.
+type StreamCallback func(chunk StreamChunk) error
+
+// StreamingCapable is an optional interface that models can implement
+// to support streaming responses.
+type StreamingCapable interface {
+	// CallStreaming calls the model with streaming support.
+	// It invokes the callback for each chunk as it arrives.
+	// Returns the final events, token count, and any error.
+	CallStreaming(ctx context.Context, inputs []Record, callback StreamCallback) ([]Record, int, error)
+}
+
+// StreamingOptsCapable is an optional interface that models can implement
+// to support streaming responses with call options.
+type StreamingOptsCapable interface {
+	// CallStreamingWithOpts calls the model with streaming support and options.
+	// It invokes the callback for each chunk as it arrives.
+	// Returns the final events, token count, and any error.
+	CallStreamingWithOpts(ctx context.Context, inputs []Record, opts CallModelOpts, callback StreamCallback) ([]Record, int, error)
+}
+
 // Middleware allows hooking into tool call lifecycle events.
 type Middleware interface {
 	// OnToolCall is invoked when a tool is about to be called.
 	OnToolCall(ctx context.Context, name, args string)
 	// OnToolResult is invoked when a tool call completes.
 	OnToolResult(ctx context.Context, name, result string, err error)
+}
+
+// StreamingMiddleware provides optional methods for hooking into streaming events.
+// Middleware can optionally implement these methods to receive streaming callbacks.
+type StreamingMiddleware interface {
+	// OnStreamStart is invoked when streaming begins.
+	OnStreamStart(ctx context.Context) error
+	// OnStreamChunk is invoked for each chunk received during streaming.
+	OnStreamChunk(ctx context.Context, chunk StreamChunk) error
+	// OnStreamComplete is invoked when streaming completes successfully.
+	OnStreamComplete(ctx context.Context, fullText string, tokens int) error
 }
 
 // ContextWindow holds our LLM context manager state.
@@ -191,6 +275,10 @@ type ContextWindow struct {
 	currentContext   string
 	registeredTools  map[string]ToolDefinition
 	toolRunners      map[string]ToolRunner
+	// streamMu protects concurrent streaming operations, particularly
+	// the final database write section to prevent race conditions
+	// when multiple streams complete simultaneously.
+	streamMu sync.Mutex
 }
 
 // ContextReader provides thread-safe read access to context window data.
@@ -556,6 +644,269 @@ func (cw *ContextWindow) CallModelWithOpts(ctx context.Context, opts CallModelOp
 	return lastMsg, nil
 }
 
+// CallModelStreaming drives an LLM with streaming support. It composes live messages,
+// invokes the model's streaming interface if available, accumulates streamed tokens,
+// and persists the complete response after the stream finishes.
+// If the model doesn't support streaming, it falls back to the buffered CallModel method.
+//
+// Thread Safety: Multiple goroutines can call CallModelStreaming concurrently.
+// Each stream operates independently with its own callback and text accumulation.
+// The streaming phase (token delivery) is non-blocking and concurrent-safe.
+// Database writes occur after streaming completes and are protected by a mutex
+// to ensure atomicity when multiple streams finish simultaneously.
+func (cw *ContextWindow) CallModelStreaming(ctx context.Context, callback StreamCallback) (string, error) {
+	return cw.CallModelStreamingWithOpts(ctx, CallModelOpts{}, callback)
+}
+
+// CallModelStreamingWithOpts drives an LLM with streaming support and options.
+// It composes live messages, invokes the model's streaming interface if available,
+// accumulates streamed tokens, and persists the complete response after the stream finishes.
+// If the model doesn't support streaming, it falls back to the buffered CallModelWithOpts method.
+//
+// Thread Safety: Multiple goroutines can call CallModelStreamingWithOpts concurrently.
+// Each stream operates independently with its own callback and text accumulation.
+// The streaming phase (token delivery) is non-blocking and concurrent-safe - callbacks
+// are invoked synchronously within each stream's execution context.
+// Database writes occur after streaming completes and are protected by a mutex
+// to ensure atomicity when multiple streams finish simultaneously.
+//
+// Note: User-provided callbacks should be thread-safe if they access shared state,
+// as they may be invoked from different goroutines when multiple streams are active.
+func (cw *ContextWindow) CallModelStreamingWithOpts(ctx context.Context, opts CallModelOpts, callback StreamCallback) (string, error) {
+	return cw.callModelStreamingWithOptsInternal(ctx, opts, callback, nil)
+}
+
+// ResumeStreamingFromPartial resumes a streaming operation from a previously saved partial response.
+// This allows continuing a stream that was interrupted due to network errors, context cancellation,
+// or other failures. The partialResponseID should be obtained from a previous streaming call that
+// was interrupted.
+//
+// The method retrieves the partial response content and accumulated token count, then continues
+// streaming from where it left off. The partial response is automatically completed when the
+// stream finishes successfully.
+//
+// Example:
+//
+//	// First attempt - gets interrupted
+//	partialID, err := cw.CallModelStreaming(ctx, callback)
+//	// ... interruption occurs ...
+//
+//	// Later, resume from partial response
+//	response, err := cw.ResumeStreamingFromPartial(ctx, partialID, callback)
+//
+// Thread Safety: Same as CallModelStreamingWithOpts - safe for concurrent use.
+func (cw *ContextWindow) ResumeStreamingFromPartial(ctx context.Context, partialResponseID string, callback StreamCallback) (string, error) {
+	return cw.ResumeStreamingFromPartialWithOpts(ctx, partialResponseID, CallModelOpts{}, callback)
+}
+
+// ResumeStreamingFromPartialWithOpts resumes a streaming operation from a partial response with options.
+// See ResumeStreamingFromPartial for details.
+func (cw *ContextWindow) ResumeStreamingFromPartialWithOpts(ctx context.Context, partialResponseID string, opts CallModelOpts, callback StreamCallback) (string, error) {
+	return cw.callModelStreamingWithOptsInternal(ctx, opts, callback, &partialResponseID)
+}
+
+// callModelStreamingWithOptsInternal is the internal implementation that supports resuming from partial responses.
+// If partialResponseID is provided, it will resume from that partial response; otherwise, it starts a new stream.
+func (cw *ContextWindow) callModelStreamingWithOptsInternal(ctx context.Context, opts CallModelOpts, callback StreamCallback, partialResponseID *string) (string, error) {
+	contextID, err := getContextIDByName(cw.db, cw.currentContext)
+	if err != nil {
+		return "", fmt.Errorf("call model streaming in context: %w", err)
+	}
+
+	recs, err := ListLiveRecords(cw.db, contextID)
+	if err != nil {
+		return "", fmt.Errorf("list live records: %w", err)
+	}
+
+	// Check if resuming from a partial response
+	var accumulatedText strings.Builder
+	var accumulatedTokens int
+	var currentPartialResponseID string
+
+	if partialResponseID != nil {
+		// Resume from partial response
+		partialContent, partialTokens, err := ResumeFromPartialResponse(cw.db, *partialResponseID)
+		if err != nil {
+			return "", fmt.Errorf("resume from partial response %s: %w", *partialResponseID, err)
+		}
+		accumulatedText.WriteString(partialContent)
+		accumulatedTokens = partialTokens
+		currentPartialResponseID = *partialResponseID
+	} else {
+		// Start new stream - generate partial response ID for tracking (only used on error)
+		currentPartialResponseID = uuid.New().String()
+	}
+
+	// Check if model supports streaming with opts
+	var events []Record
+	var tokensUsed int
+
+	// Invoke OnStreamStart for all middleware that support it
+	for _, mw := range cw.middleware {
+		if streamMw, ok := mw.(StreamingMiddleware); ok {
+			if err := streamMw.OnStreamStart(ctx); err != nil {
+				return "", fmt.Errorf("middleware OnStreamStart error: %w", err)
+			}
+		}
+	}
+
+	// Helper function to save partial response on error/interruption only
+	// This is called when streaming fails or is interrupted, allowing resume later
+	savePartialResponseOnError := func() {
+		if currentPartialResponseID == "" {
+			return // No partial response ID to save
+		}
+		content := accumulatedText.String()
+		if content != "" {
+			// Try to save partial response, but don't fail if it doesn't work
+			// Ignore errors to avoid breaking the error propagation
+			_, _ = SavePartialResponse(cw.db, contextID, content, currentPartialResponseID, accumulatedTokens)
+		}
+	}
+
+	if optsModel, ok := cw.model.(StreamingOptsCapable); ok {
+		// Model supports streaming with opts
+		streamCallback := func(chunk StreamChunk) error {
+			// Accumulate text from chunks
+			if chunk.Delta != "" {
+				accumulatedText.WriteString(chunk.Delta)
+			}
+
+			// Invoke OnStreamChunk for all middleware that support it
+			for _, mw := range cw.middleware {
+				if streamMw, ok := mw.(StreamingMiddleware); ok {
+					if err := streamMw.OnStreamChunk(ctx, chunk); err != nil {
+						return fmt.Errorf("middleware OnStreamChunk error: %w", err)
+					}
+				}
+			}
+
+			// Invoke user callback
+			if callback != nil {
+				if err := callback(chunk); err != nil {
+					return err
+				}
+			}
+			// Check for errors in chunk
+			if chunk.Error != nil {
+				return chunk.Error
+			}
+			return nil
+		}
+
+		events, tokensUsed, err = optsModel.CallStreamingWithOpts(ctx, recs, opts, streamCallback)
+		if err != nil {
+			// Save partial response on error to allow resume
+			savePartialResponseOnError()
+			return "", fmt.Errorf("call model streaming with opts: %w", err)
+		}
+	} else if streamingModel, ok := cw.model.(StreamingCapable); ok {
+		// Model supports streaming but not opts
+		streamCallback := func(chunk StreamChunk) error {
+			// Accumulate text from chunks
+			if chunk.Delta != "" {
+				accumulatedText.WriteString(chunk.Delta)
+			}
+
+			// Invoke OnStreamChunk for all middleware that support it
+			for _, mw := range cw.middleware {
+				if streamMw, ok := mw.(StreamingMiddleware); ok {
+					if err := streamMw.OnStreamChunk(ctx, chunk); err != nil {
+						return fmt.Errorf("middleware OnStreamChunk error: %w", err)
+					}
+				}
+			}
+
+			// Invoke user callback
+			if callback != nil {
+				if err := callback(chunk); err != nil {
+					return err
+				}
+			}
+			// Check for errors in chunk
+			if chunk.Error != nil {
+				return chunk.Error
+			}
+			return nil
+		}
+
+		events, tokensUsed, err = streamingModel.CallStreaming(ctx, recs, streamCallback)
+		if err != nil {
+			// Save partial response on error to allow resume
+			savePartialResponseOnError()
+			return "", fmt.Errorf("call model streaming: %w", err)
+		}
+	} else {
+		// Model doesn't support streaming, fall back to buffered call
+		return cw.CallModelWithOpts(ctx, opts)
+	}
+
+	// Get final text from accumulated chunks or from events
+	fullText := accumulatedText.String()
+	if fullText == "" && len(events) > 0 {
+		// Fallback to event content if accumulation didn't work
+		for _, event := range events {
+			if event.Source == ModelResp {
+				fullText = event.Content
+				break
+			}
+		}
+	}
+
+	// Invoke OnStreamComplete for all middleware that support it
+	for _, mw := range cw.middleware {
+		if streamMw, ok := mw.(StreamingMiddleware); ok {
+			if err := streamMw.OnStreamComplete(ctx, fullText, tokensUsed); err != nil {
+				return "", fmt.Errorf("middleware OnStreamComplete error: %w", err)
+			}
+		}
+	}
+
+	// Update metrics (already protected by Metrics mutex)
+	cw.metrics.Add(tokensUsed)
+
+	// Persist events after stream completes.
+	// This section is protected by streamMu to ensure atomicity when multiple
+	// streams complete simultaneously. Database writes do not block streaming
+	// itself, as they only occur after the stream has finished.
+	cw.streamMu.Lock()
+	var lastMsg string
+	var finalResponseID *string
+	for _, event := range events {
+		// Capture response ID from model response event
+		if event.Source == ModelResp && event.ResponseID != nil {
+			finalResponseID = event.ResponseID
+		}
+		_, err = InsertRecordWithResponseID(
+			cw.db,
+			contextID,
+			event.Source,
+			event.Content,
+			event.Live,
+			event.ResponseID,
+		)
+		if err != nil {
+			cw.streamMu.Unlock()
+			return "", fmt.Errorf("insert model response: %w", err)
+		}
+		lastMsg = event.Content
+	}
+
+	// Complete the partial response now that streaming finished successfully
+	// Only do this if we're resuming from a partial response (partialResponseID != nil)
+	// For new streams, we don't create a partial response record unless there's an error
+	if currentPartialResponseID != "" && partialResponseID != nil {
+		// We're completing a resumed partial response - mark it as complete
+		if err := CompletePartialResponse(cw.db, currentPartialResponseID, finalResponseID); err != nil {
+			cw.streamMu.Unlock()
+			return "", fmt.Errorf("complete partial response: %w", err)
+		}
+	}
+	cw.streamMu.Unlock()
+
+	return lastMsg, nil
+}
+
 func (cw *ContextWindow) TotalTokens() int {
 	return cw.metrics.Total()
 }
@@ -911,4 +1262,61 @@ func (cr *ContextReader) MaxTokens() int {
 // Clone creates a copy of the current context with a new name.
 func (cw *ContextWindow) Clone(destName string) error {
 	return CloneContext(cw.db, cw.currentContext, destName)
+}
+
+// isNetworkError checks if an error is a network-related error.
+// This helps distinguish network failures from other types of errors.
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for context cancellation (not a network error)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	// Check for network errors
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	// Check for URL errors (often network-related)
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+
+	// Check for syscall errors that indicate network issues
+	var sysErr syscall.Errno
+	if errors.As(err, &sysErr) {
+		// Common network-related syscall errors
+		switch sysErr {
+		case syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.ETIMEDOUT,
+			syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ENOTCONN:
+			return true
+		}
+	}
+
+	// Check error message for common network error patterns
+	errStr := err.Error()
+	networkPatterns := []string{
+		"connection refused",
+		"connection reset",
+		"timeout",
+		"network",
+		"dial tcp",
+		"no such host",
+		"connection closed",
+		"broken pipe",
+		"EOF",
+	}
+	for _, pattern := range networkPatterns {
+		if strings.Contains(strings.ToLower(errStr), pattern) {
+			return true
+		}
+	}
+
+	return false
 }

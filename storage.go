@@ -23,14 +23,17 @@ const (
 
 // Record is one row in context history.
 type Record struct {
-	ID         int64      `json:"id"`
-	Timestamp  time.Time  `json:"timestamp"`
-	Source     RecordType `json:"source"`
-	Content    string     `json:"content"`
-	Live       bool       `json:"live"`
-	EstTokens  int        `json:"est_tokens"`
-	ContextID  string     `json:"context_id"`
-	ResponseID *string    `json:"response_id,omitempty"`
+	ID                int64      `json:"id"`
+	Timestamp         time.Time  `json:"timestamp"`
+	Source            RecordType `json:"source"`
+	Content           string     `json:"content"`
+	Live              bool       `json:"live"`
+	EstTokens         int        `json:"est_tokens"`
+	ContextID         string     `json:"context_id"`
+	ResponseID        *string    `json:"response_id,omitempty"`
+	Streamed          bool       `json:"streamed"`
+	PartialResponseID *string    `json:"partial_response_id,omitempty"`
+	AccumulatedTokens *int       `json:"accumulated_tokens,omitempty"`
 }
 
 // Context represents a named context window with metadata.
@@ -108,6 +111,21 @@ CREATE TABLE IF NOT EXISTS context_tools (
 	err = addColumnIfNotExists(db, "records", "response_id", "TEXT NULL")
 	if err != nil {
 		return fmt.Errorf("add response_id column: %w", err)
+	}
+
+	err = addColumnIfNotExists(db, "records", "streamed", "BOOLEAN NOT NULL DEFAULT 0")
+	if err != nil {
+		return fmt.Errorf("add streamed column: %w", err)
+	}
+
+	err = addColumnIfNotExists(db, "records", "partial_response_id", "TEXT NULL")
+	if err != nil {
+		return fmt.Errorf("add partial_response_id column: %w", err)
+	}
+
+	err = addColumnIfNotExists(db, "records", "accumulated_tokens", "INTEGER NULL")
+	if err != nil {
+		return fmt.Errorf("add accumulated_tokens column: %w", err)
 	}
 
 	// Create indexes
@@ -323,6 +341,18 @@ func InsertRecord(
 	return InsertRecordWithResponseID(db, contextID, source, content, live, nil)
 }
 
+// InsertRecordStreamed inserts a new record with streaming flag.
+func InsertRecordStreamed(
+	db *sql.DB,
+	contextID string,
+	source RecordType,
+	content string,
+	live bool,
+	streamed bool,
+) (Record, error) {
+	return InsertRecordWithResponseIDAndStreamed(db, contextID, source, content, live, nil, streamed)
+}
+
 // InsertRecordWithResponseID inserts a new record with optional response ID.
 func InsertRecordWithResponseID(
 	db *sql.DB,
@@ -332,12 +362,40 @@ func InsertRecordWithResponseID(
 	live bool,
 	responseID *string,
 ) (Record, error) {
+	return InsertRecordWithResponseIDAndStreamed(db, contextID, source, content, live, responseID, false)
+}
+
+// InsertRecordWithResponseIDAndStreamed inserts a new record with optional response ID and streaming flag.
+func InsertRecordWithResponseIDAndStreamed(
+	db *sql.DB,
+	contextID string,
+	source RecordType,
+	content string,
+	live bool,
+	responseID *string,
+	streamed bool,
+) (Record, error) {
+	return InsertRecordWithPartialResponse(db, contextID, source, content, live, responseID, streamed, nil, nil)
+}
+
+// InsertRecordWithPartialResponse inserts a new record with optional response ID, streaming flag, and partial response tracking.
+func InsertRecordWithPartialResponse(
+	db *sql.DB,
+	contextID string,
+	source RecordType,
+	content string,
+	live bool,
+	responseID *string,
+	streamed bool,
+	partialResponseID *string,
+	accumulatedTokens *int,
+) (Record, error) {
 	now := time.Now().UTC()
 	t := tokenCount(content)
 	res, err := db.Exec(
-		`INSERT INTO records (context_id, ts, source, content, live, est_tokens, response_id) 
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		contextID, now, int(source), content, live, t, responseID,
+		`INSERT INTO records (context_id, ts, source, content, live, est_tokens, response_id, streamed, partial_response_id, accumulated_tokens) 
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		contextID, now, int(source), content, live, t, responseID, streamed, partialResponseID, accumulatedTokens,
 	)
 	if err != nil {
 		return Record{}, fmt.Errorf("insert record: %w", err)
@@ -347,14 +405,17 @@ func InsertRecordWithResponseID(
 		return Record{}, fmt.Errorf("get last insert id: %w", err)
 	}
 	return Record{
-		ID:         id,
-		Timestamp:  now,
-		Source:     source,
-		Content:    content,
-		Live:       live,
-		EstTokens:  t,
-		ContextID:  contextID,
-		ResponseID: responseID,
+		ID:                id,
+		Timestamp:         now,
+		Source:            source,
+		Content:           content,
+		Live:              live,
+		EstTokens:         t,
+		ContextID:         contextID,
+		ResponseID:        responseID,
+		Streamed:          streamed,
+		PartialResponseID: partialResponseID,
+		AccumulatedTokens: accumulatedTokens,
 	}, nil
 }
 
@@ -370,7 +431,8 @@ func ListRecordsInContext(db *sql.DB, contextID string) ([]Record, error) {
 
 func listRecordsWhere(db *sql.DB, whereClause string, args ...interface{}) ([]Record, error) {
 	query := fmt.Sprintf(
-		`SELECT id, context_id, ts, source, content, live, est_tokens, response_id 
+		`SELECT id, context_id, ts, source, content, live, est_tokens, response_id, 
+		 COALESCE(streamed, 0) as streamed, partial_response_id, accumulated_tokens
 		 FROM records WHERE %s ORDER BY ts ASC`,
 		whereClause,
 	)
@@ -393,6 +455,9 @@ func listRecordsWhere(db *sql.DB, whereClause string, args ...interface{}) ([]Re
 			&r.Live,
 			&r.EstTokens,
 			&r.ResponseID,
+			&r.Streamed,
+			&r.PartialResponseID,
+			&r.AccumulatedTokens,
 		); err != nil {
 			return nil, fmt.Errorf("scan record: %w", err)
 		}
@@ -434,12 +499,38 @@ func insertRecordTxWithResponseID(
 	live bool,
 	responseID *string,
 ) (Record, error) {
+	return insertRecordTxWithResponseIDAndStreamed(tx, contextID, source, content, live, responseID, false)
+}
+
+func insertRecordTxWithResponseIDAndStreamed(
+	tx *sql.Tx,
+	contextID string,
+	source RecordType,
+	content string,
+	live bool,
+	responseID *string,
+	streamed bool,
+) (Record, error) {
+	return insertRecordTxWithPartialResponse(tx, contextID, source, content, live, responseID, streamed, nil, nil)
+}
+
+func insertRecordTxWithPartialResponse(
+	tx *sql.Tx,
+	contextID string,
+	source RecordType,
+	content string,
+	live bool,
+	responseID *string,
+	streamed bool,
+	partialResponseID *string,
+	accumulatedTokens *int,
+) (Record, error) {
 	now := time.Now().UTC()
 	t := tokenCount(content)
 	res, err := tx.Exec(
-		`INSERT INTO records (context_id, ts, source, content, live, est_tokens, response_id) 
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		contextID, now, int(source), content, live, t, responseID,
+		`INSERT INTO records (context_id, ts, source, content, live, est_tokens, response_id, streamed, partial_response_id, accumulated_tokens) 
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		contextID, now, int(source), content, live, t, responseID, streamed, partialResponseID, accumulatedTokens,
 	)
 	if err != nil {
 		return Record{}, fmt.Errorf("insert record tx: %w", err)
@@ -449,14 +540,17 @@ func insertRecordTxWithResponseID(
 		return Record{}, fmt.Errorf("get last insert id tx: %w", err)
 	}
 	return Record{
-		ID:         id,
-		Timestamp:  now,
-		Source:     source,
-		Content:    content,
-		Live:       live,
-		EstTokens:  t,
-		ContextID:  contextID,
-		ResponseID: responseID,
+		ID:                id,
+		Timestamp:         now,
+		Source:            source,
+		Content:           content,
+		Live:              live,
+		EstTokens:         t,
+		ContextID:         contextID,
+		ResponseID:        responseID,
+		Streamed:          streamed,
+		PartialResponseID: partialResponseID,
+		AccumulatedTokens: accumulatedTokens,
 	}, nil
 }
 
@@ -662,8 +756,8 @@ func CloneContext(db *sql.DB, sourceName, destName string) error {
 
 	// Copy all records from source to destination
 	_, err = db.Exec(`
-		INSERT INTO records (context_id, source, content, live, est_tokens, ts, response_id)
-		SELECT ?, source, content, live, est_tokens, ts, response_id
+		INSERT INTO records (context_id, source, content, live, est_tokens, ts, response_id, streamed, partial_response_id, accumulated_tokens)
+		SELECT ?, source, content, live, est_tokens, ts, response_id, COALESCE(streamed, 0), partial_response_id, accumulated_tokens
 		FROM records
 		WHERE context_id = ?`,
 		destContext.ID, sourceContext.ID)
@@ -766,6 +860,110 @@ func getLastResponseID(records []Record) *string {
 		if records[i].Source == ModelResp && records[i].ResponseID != nil {
 			return records[i].ResponseID
 		}
+	}
+	return nil
+}
+
+// SavePartialResponse saves a partial streaming response with tracking information.
+// This allows resuming a stream after interruption.
+// partialResponseID should be a unique identifier for this partial response session.
+// accumulatedTokens is the total number of tokens accumulated so far in the stream.
+func SavePartialResponse(
+	db *sql.DB,
+	contextID string,
+	content string,
+	partialResponseID string,
+	accumulatedTokens int,
+) (Record, error) {
+	return InsertRecordWithPartialResponse(
+		db,
+		contextID,
+		ModelResp,
+		content,
+		true, // live
+		nil,  // responseID
+		true, // streamed
+		&partialResponseID,
+		&accumulatedTokens,
+	)
+}
+
+// FindPartialResponse finds a partial response by its partial_response_id.
+// Returns the record if found, or sql.ErrNoRows if not found.
+func FindPartialResponse(db *sql.DB, partialResponseID string) (Record, error) {
+	var r Record
+	var src int
+	err := db.QueryRow(
+		`SELECT id, context_id, ts, source, content, live, est_tokens, response_id, 
+		 COALESCE(streamed, 0) as streamed, partial_response_id, accumulated_tokens
+		 FROM records WHERE partial_response_id = ? AND live = 1`,
+		partialResponseID,
+	).Scan(
+		&r.ID,
+		&r.ContextID,
+		&r.Timestamp,
+		&src,
+		&r.Content,
+		&r.Live,
+		&r.EstTokens,
+		&r.ResponseID,
+		&r.Streamed,
+		&r.PartialResponseID,
+		&r.AccumulatedTokens,
+	)
+	if err != nil {
+		return Record{}, fmt.Errorf("find partial response %s: %w", partialResponseID, err)
+	}
+	r.Source = RecordType(src)
+	return r, nil
+}
+
+// ResumeFromPartialResponse retrieves a partial response and returns its content and accumulated token count.
+// This allows resuming a stream from where it left off.
+func ResumeFromPartialResponse(db *sql.DB, partialResponseID string) (content string, accumulatedTokens int, err error) {
+	rec, err := FindPartialResponse(db, partialResponseID)
+	if err != nil {
+		return "", 0, err
+	}
+	if rec.AccumulatedTokens == nil {
+		return rec.Content, 0, nil
+	}
+	return rec.Content, *rec.AccumulatedTokens, nil
+}
+
+// UpdatePartialResponse updates an existing partial response with new content and token count.
+// This is used to update a partial response as more tokens arrive during streaming.
+func UpdatePartialResponse(
+	db *sql.DB,
+	partialResponseID string,
+	content string,
+	accumulatedTokens int,
+) error {
+	_, err := db.Exec(
+		`UPDATE records SET content = ?, accumulated_tokens = ?, est_tokens = ? 
+		 WHERE partial_response_id = ? AND live = 1`,
+		content, accumulatedTokens, tokenCount(content), partialResponseID,
+	)
+	if err != nil {
+		return fmt.Errorf("update partial response %s: %w", partialResponseID, err)
+	}
+	return nil
+}
+
+// CompletePartialResponse marks a partial response as complete by removing the partial_response_id
+// and optionally setting a final response_id. This should be called when streaming finishes successfully.
+func CompletePartialResponse(
+	db *sql.DB,
+	partialResponseID string,
+	responseID *string,
+) error {
+	_, err := db.Exec(
+		`UPDATE records SET partial_response_id = NULL, accumulated_tokens = NULL, response_id = ? 
+		 WHERE partial_response_id = ? AND live = 1`,
+		responseID, partialResponseID,
+	)
+	if err != nil {
+		return fmt.Errorf("complete partial response %s: %w", partialResponseID, err)
 	}
 	return nil
 }

@@ -1,3 +1,5 @@
+//go:build integration
+
 package contextwindow
 
 import (
@@ -10,6 +12,35 @@ import (
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/genai"
 )
+
+// isQuotaExhaustedError checks if an error indicates quota/rate limit exhaustion.
+// This helps tests skip gracefully instead of failing when API quotas are exhausted.
+func isQuotaExhaustedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	// HTTP status code for rate limiting
+	if strings.Contains(errStr, "429") {
+		return true
+	}
+	// gRPC/API status codes
+	if strings.Contains(errStr, "resource_exhausted") {
+		return true
+	}
+	// Common error message patterns across providers
+	patterns := []string{
+		"quota exceeded",
+		"rate limit",
+		"too many requests",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+	return false
+}
 
 func TestGeminiModel_HelloWorld(t *testing.T) {
 	if os.Getenv("GOOGLE_GENAI_API_KEY") == "" && os.Getenv("GEMINI_API_KEY") == "" {
@@ -24,6 +55,9 @@ func TestGeminiModel_HelloWorld(t *testing.T) {
 	}
 	reply, _, err := m.Call(context.Background(), inputs)
 	if err != nil {
+		if isQuotaExhaustedError(err) {
+			t.Skipf("Skipping test due to quota exhaustion: %v", err)
+		}
 		t.Fatalf("Call: %v", err)
 	}
 	if len(reply) == 0 {
@@ -77,6 +111,9 @@ func TestGeminiModel_ToolCall(t *testing.T) {
 
 	result, err := cw.CallModel(context.Background())
 	if err != nil {
+		if isQuotaExhaustedError(err) {
+			t.Skipf("Skipping test due to quota exhaustion: %v", err)
+		}
 		t.Fatalf("Call: %v", err)
 	}
 
@@ -106,7 +143,12 @@ func TestGeminiModel_SystemPrompt(t *testing.T) {
 	assert.NoError(t, err)
 
 	resp, err := cw.CallModel(context.Background())
-	assert.NoError(t, err)
+	if err != nil {
+		if isQuotaExhaustedError(err) {
+			t.Skipf("Skipping test due to quota exhaustion: %v", err)
+		}
+		assert.NoError(t, err)
+	}
 
 	assert.Contains(t, resp, "MUMON")
 }
@@ -180,7 +222,12 @@ func TestGeminiModel_ToolBuilder(t *testing.T) {
 	assert.NoError(t, err)
 
 	resp, err := cw.CallModel(context.Background())
-	assert.NoError(t, err)
+	if err != nil {
+		if isQuotaExhaustedError(err) {
+			t.Skipf("Skipping test due to quota exhaustion: %v", err)
+		}
+		assert.NoError(t, err)
+	}
 	assert.Contains(t, resp, "56")
 }
 
@@ -202,6 +249,9 @@ func TestAllGeminiModels_BasicCall(t *testing.T) {
 
 			reply, tokensUsed, err := m.Call(context.Background(), inputs)
 			if err != nil {
+				if isQuotaExhaustedError(err) {
+					t.Skipf("Skipping test for %s due to quota exhaustion: %v", model, err)
+				}
 				t.Fatalf("Call(%s): %v", model, err)
 			}
 
@@ -222,4 +272,183 @@ func TestAllGeminiModels_BasicCall(t *testing.T) {
 			t.Logf("✓ Model %s: %d tokens used, response: %.50s...", model, tokensUsed, reply[len(reply)-1].Content)
 		})
 	}
+}
+
+// TestGeminiModel_CallStreaming tests basic streaming functionality
+func TestGeminiModel_CallStreaming(t *testing.T) {
+	if os.Getenv("GOOGLE_GENAI_API_KEY") == "" && os.Getenv("GEMINI_API_KEY") == "" {
+		t.Skip("set GOOGLE_GENAI_API_KEY or GEMINI_API_KEY to run integration test")
+	}
+
+	m, err := NewGeminiModel(ModelGemini20Flash)
+	if err != nil {
+		t.Fatalf("NewGeminiModel: %v", err)
+	}
+
+	inputs := []Record{
+		{Source: Prompt, Content: "Say 'hello' and nothing else."},
+	}
+
+	var receivedChunks []StreamChunk
+	var accumulatedText strings.Builder
+
+	callback := func(chunk StreamChunk) error {
+		receivedChunks = append(receivedChunks, chunk)
+		if chunk.Delta != "" {
+			accumulatedText.WriteString(chunk.Delta)
+		}
+		return nil
+	}
+
+	events, tokens, err := m.CallStreaming(context.Background(), inputs, callback)
+	if err != nil {
+		if isQuotaExhaustedError(err) {
+			t.Skipf("Skipping test due to quota exhaustion: %v", err)
+		}
+		assert.NoError(t, err)
+	}
+	assert.Greater(t, len(events), 0)
+	assert.Greater(t, tokens, 0)
+	assert.Greater(t, len(receivedChunks), 0, "should receive at least one chunk")
+
+	// Check that we got a done chunk
+	var hasDoneChunk bool
+	for _, chunk := range receivedChunks {
+		if chunk.Done {
+			hasDoneChunk = true
+			break
+		}
+	}
+	assert.True(t, hasDoneChunk, "should receive a done chunk")
+
+	// Check that accumulated text matches final event
+	finalContent := accumulatedText.String()
+	assert.NotEmpty(t, finalContent)
+	assert.Equal(t, finalContent, events[len(events)-1].Content)
+	assert.Contains(t, strings.ToLower(finalContent), "hello")
+}
+
+// TestGeminiModel_CallStreamingWithOpts tests streaming with options
+func TestGeminiModel_CallStreamingWithOpts(t *testing.T) {
+	if os.Getenv("GOOGLE_GENAI_API_KEY") == "" && os.Getenv("GEMINI_API_KEY") == "" {
+		t.Skip("set GOOGLE_GENAI_API_KEY or GEMINI_API_KEY to run integration test")
+	}
+
+	m, err := NewGeminiModel(ModelGemini20Flash)
+	if err != nil {
+		t.Fatalf("NewGeminiModel: %v", err)
+	}
+
+	inputs := []Record{
+		{Source: Prompt, Content: "Count to 3."},
+	}
+
+	var chunkCount int
+	callback := func(chunk StreamChunk) error {
+		if !chunk.Done {
+			chunkCount++
+		}
+		return nil
+	}
+
+	events, _, err := m.CallStreamingWithOpts(context.Background(), inputs, CallModelOpts{}, callback)
+	if err != nil {
+		if isQuotaExhaustedError(err) {
+			t.Skipf("Skipping test due to quota exhaustion: %v", err)
+		}
+		assert.NoError(t, err)
+	}
+	assert.Greater(t, len(events), 0)
+	assert.Greater(t, chunkCount, 0, "should receive content chunks")
+}
+
+// TestGeminiModel_CallStreaming_DeltaAccumulation tests that deltas are accumulated correctly
+func TestGeminiModel_CallStreaming_DeltaAccumulation(t *testing.T) {
+	if os.Getenv("GOOGLE_GENAI_API_KEY") == "" && os.Getenv("GEMINI_API_KEY") == "" {
+		t.Skip("set GOOGLE_GENAI_API_KEY or GEMINI_API_KEY to run integration test")
+	}
+
+	m, err := NewGeminiModel(ModelGemini20Flash)
+	if err != nil {
+		t.Fatalf("NewGeminiModel: %v", err)
+	}
+
+	inputs := []Record{
+		{Source: Prompt, Content: "Write the numbers 1, 2, 3 in sequence."},
+	}
+
+	var deltas []string
+	callback := func(chunk StreamChunk) error {
+		if chunk.Delta != "" {
+			deltas = append(deltas, chunk.Delta)
+		}
+		return nil
+	}
+
+	events, _, err := m.CallStreaming(context.Background(), inputs, callback)
+	if err != nil {
+		if isQuotaExhaustedError(err) {
+			t.Skipf("Skipping test due to quota exhaustion: %v", err)
+		}
+		assert.NoError(t, err)
+	}
+	assert.Greater(t, len(deltas), 0, "should receive multiple deltas")
+
+	// Accumulate deltas and verify they match the final content
+	var accumulated strings.Builder
+	for _, delta := range deltas {
+		accumulated.WriteString(delta)
+	}
+	assert.Equal(t, accumulated.String(), events[len(events)-1].Content)
+}
+
+// TestGeminiModel_CallStreaming_FunctionCalls tests function calls in streaming mode
+func TestGeminiModel_CallStreaming_FunctionCalls(t *testing.T) {
+	if os.Getenv("GOOGLE_GENAI_API_KEY") == "" && os.Getenv("GEMINI_API_KEY") == "" {
+		t.Skip("set GOOGLE_GENAI_API_KEY or GEMINI_API_KEY to run integration test")
+	}
+
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	model, err := NewGeminiModel(ModelGemini20Flash)
+	assert.NoError(t, err)
+
+	cw, err := NewContextWindow(db, model, "test")
+	assert.NoError(t, err)
+
+	lsTool := &genai.FunctionDeclaration{
+		Name:        "ls",
+		Description: "list files in a directory",
+		Parameters: &genai.Schema{
+			Type:       genai.TypeObject,
+			Properties: map[string]*genai.Schema{},
+		},
+	}
+
+	err = cw.RegisterTool("ls", lsTool, ToolRunnerFunc(func(ctx context.Context, args json.RawMessage) (string, error) {
+		return `{"files": ["go.mod", "spiderman.txt", "batman.txt"]}`, nil
+	}))
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("Please use the `ls` tool to list the files in the current directory.")
+	assert.NoError(t, err)
+
+	var receivedChunks []StreamChunk
+	callback := func(chunk StreamChunk) error {
+		receivedChunks = append(receivedChunks, chunk)
+		return nil
+	}
+
+	response, err := cw.CallModelStreaming(context.Background(), callback)
+	if err != nil {
+		if isQuotaExhaustedError(err) {
+			t.Skipf("Skipping test due to quota exhaustion: %v", err)
+		}
+		assert.NoError(t, err)
+	}
+	assert.Contains(t, response, "go.mod")
+	assert.Contains(t, response, "batman")
+	assert.Greater(t, len(receivedChunks), 0, "should receive chunks during streaming")
 }

@@ -1658,8 +1658,8 @@ func TestThreadingBehaviorResume(t *testing.T) {
 
 // MockThreadingModel implements both interfaces for testing threading behavior
 type MockThreadingModel struct {
-	callCount int
-	lastInputs []Record
+	callCount      int
+	lastInputs     []Record
 	lastServerSide bool
 	lastResponseID *string
 }
@@ -2085,7 +2085,7 @@ func TestContextWindow_SetRecordLiveStateByRange(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, liveRecords, 3)
 	assert.Equal(t, Prompt, liveRecords[0].Source)
-	assert.Equal(t, ToolCall, liveRecords[1].Source) 
+	assert.Equal(t, ToolCall, liveRecords[1].Source)
 	assert.Equal(t, ToolOutput, liveRecords[2].Source)
 
 	err = cw.SetRecordLiveStateByRange(1, 2, false)
@@ -2142,7 +2142,7 @@ func TestContextWindow_SetRecordLiveStateByRange_ErrorCases(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid range")
 
-	err = cw.SetRecordLiveStateByRange(2, 1, false) 
+	err = cw.SetRecordLiveStateByRange(2, 1, false)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid range")
 
@@ -2164,7 +2164,7 @@ func TestContextWindow_SetRecordLiveStateByRange_Revive(t *testing.T) {
 
 	err = cw.AddPrompt("First")
 	assert.NoError(t, err)
-	err = cw.AddPrompt("Second") 
+	err = cw.AddPrompt("Second")
 	assert.NoError(t, err)
 	err = cw.AddPrompt("Third")
 	assert.NoError(t, err)
@@ -2746,4 +2746,771 @@ func (m *failingClientSideModel) SetToolExecutor(executor ToolExecutor) {
 
 func (m *failingClientSideModel) SetMiddleware(middleware []Middleware) {
 	// No-op
+}
+
+// TestStreamChunkSerialization tests that StreamChunk can be serialized and deserialized.
+func TestStreamChunkSerialization(t *testing.T) {
+	tests := []struct {
+		name  string
+		chunk StreamChunk
+	}{
+		{
+			name: "basic chunk with delta",
+			chunk: StreamChunk{
+				Delta: "Hello",
+				Done:  false,
+			},
+		},
+		{
+			name: "chunk with metadata",
+			chunk: StreamChunk{
+				Delta: "World",
+				Done:  false,
+				Metadata: map[string]any{
+					"provider": "openai",
+					"index":    1,
+				},
+			},
+		},
+		{
+			name: "done chunk",
+			chunk: StreamChunk{
+				Delta: "",
+				Done:  true,
+			},
+		},
+		{
+			name: "chunk with error",
+			chunk: StreamChunk{
+				Delta: "",
+				Done:  true,
+				Error: fmt.Errorf("stream error"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Skip error serialization test - errors don't serialize well in JSON
+			if tt.chunk.Error != nil {
+				// Just verify the chunk with error can be created
+				assert.NotNil(t, tt.chunk.Error, "Error should be set")
+				return
+			}
+
+			// Test JSON serialization
+			data, err := json.Marshal(tt.chunk)
+			assert.NoError(t, err, "should marshal without error")
+			assert.NotEmpty(t, data, "marshaled data should not be empty")
+
+			// Test JSON deserialization
+			var unmarshaled StreamChunk
+			err = json.Unmarshal(data, &unmarshaled)
+			assert.NoError(t, err, "should unmarshal without error")
+
+			// Compare fields
+			assert.Equal(t, tt.chunk.Delta, unmarshaled.Delta, "Delta should match")
+			assert.Equal(t, tt.chunk.Done, unmarshaled.Done, "Done should match")
+
+			// Metadata: JSON unmarshals numbers as float64, so we need to compare values
+			if tt.chunk.Metadata != nil {
+				assert.NotNil(t, unmarshaled.Metadata, "Metadata should be preserved")
+				// Compare string values directly, and handle numeric conversion
+				for k, v := range tt.chunk.Metadata {
+					unmarshaledV, exists := unmarshaled.Metadata[k]
+					assert.True(t, exists, "Metadata key %s should exist", k)
+					// Convert both to strings for comparison (handles int->float64 conversion)
+					assert.Equal(t, fmt.Sprintf("%v", v), fmt.Sprintf("%v", unmarshaledV), "Metadata value for %s should match", k)
+				}
+			}
+		})
+	}
+}
+
+// mockStreamingModel is a test helper that implements streaming interfaces.
+type mockStreamingModel struct {
+	chunks      []string
+	events      []Record
+	tokensUsed  int
+	lastOpts    *CallModelOpts
+	callbackErr error // If set, callback will return this error
+	shouldError bool  // If true, send error chunk
+}
+
+// Call implements Model interface (for fallback scenarios).
+func (m *mockStreamingModel) Call(ctx context.Context, inputs []Record) ([]Record, int, error) {
+	return m.events, m.tokensUsed, nil
+}
+
+// CallStreaming implements StreamingCapable.
+func (m *mockStreamingModel) CallStreaming(ctx context.Context, inputs []Record, callback StreamCallback) ([]Record, int, error) {
+	// If shouldError is set, send error chunk
+	if m.shouldError {
+		errChunk := StreamChunk{
+			Error: fmt.Errorf("stream error"),
+			Done:  false,
+		}
+		if callback != nil {
+			if err := callback(errChunk); err != nil {
+				return nil, 0, err
+			}
+		}
+		return nil, 0, fmt.Errorf("stream error")
+	}
+
+	// Stream chunks
+	for _, chunkText := range m.chunks {
+		chunk := StreamChunk{
+			Delta: chunkText,
+			Done:  false,
+		}
+		if callback != nil {
+			if err := callback(chunk); err != nil {
+				return nil, 0, err
+			}
+			// Check if callback should error
+			if m.callbackErr != nil {
+				return nil, 0, m.callbackErr
+			}
+		}
+	}
+	// Send done chunk
+	if callback != nil {
+		doneChunk := StreamChunk{Done: true}
+		if err := callback(doneChunk); err != nil {
+			return nil, 0, err
+		}
+	}
+	return m.events, m.tokensUsed, nil
+}
+
+// CallStreamingWithOpts implements StreamingOptsCapable.
+func (m *mockStreamingModel) CallStreamingWithOpts(ctx context.Context, inputs []Record, opts CallModelOpts, callback StreamCallback) ([]Record, int, error) {
+	// Store opts for verification
+	m.lastOpts = &opts
+	return m.CallStreaming(ctx, inputs, callback)
+}
+
+// TestStreamingInterfacesCompile verifies that the streaming interfaces can be implemented.
+func TestStreamingInterfacesCompile(t *testing.T) {
+	// This test verifies that the interfaces compile correctly by creating mock implementations.
+	// If the interfaces have syntax errors, this test will fail to compile.
+
+	mock := &mockStreamingModel{}
+
+	// Verify StreamingCapable can be implemented
+	var _ StreamingCapable = mock
+
+	// Verify StreamingOptsCapable can be implemented
+	var _ StreamingOptsCapable = mock
+
+	// If we get here, the interfaces compile correctly
+	assert.True(t, true, "interfaces compile successfully")
+}
+
+// TestCallModelStreaming tests streaming with a mock streaming model.
+func TestCallModelStreaming(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	// Create a mock streaming model that streams chunks
+	mockModel := &mockStreamingModel{
+		chunks: []string{"Hello", " ", "world", "!"},
+		events: []Record{
+			{
+				Source:    ModelResp,
+				Content:   "Hello world!",
+				Live:      true,
+				EstTokens: 3,
+			},
+		},
+		tokensUsed: 15,
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("test prompt")
+	assert.NoError(t, err)
+
+	// Track chunks received by callback
+	var receivedChunks []StreamChunk
+	callback := func(chunk StreamChunk) error {
+		receivedChunks = append(receivedChunks, chunk)
+		return nil
+	}
+
+	// Call streaming method
+	response, err := cw.CallModelStreaming(context.Background(), callback)
+	assert.NoError(t, err)
+	assert.Equal(t, "Hello world!", response)
+
+	// Verify callback was called for each chunk plus done
+	assert.Len(t, receivedChunks, len(mockModel.chunks)+1, "callback should be called for each chunk plus done")
+
+	// Verify chunks were received in order
+	for i, chunkText := range mockModel.chunks {
+		assert.Equal(t, chunkText, receivedChunks[i].Delta, "chunk %d should match", i)
+		assert.False(t, receivedChunks[i].Done, "chunk %d should not be done", i)
+	}
+	// Last chunk should be done
+	assert.True(t, receivedChunks[len(receivedChunks)-1].Done, "last chunk should be done")
+
+	// Verify persistence - check that response was saved
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	assert.Greater(t, len(recs), 1, "should have prompt and response records")
+
+	// Find the model response
+	var foundResponse bool
+	for _, rec := range recs {
+		if rec.Source == ModelResp && rec.Content == "Hello world!" {
+			foundResponse = true
+			break
+		}
+	}
+	assert.True(t, foundResponse, "response should be persisted in database")
+
+	// Verify token metrics were updated
+	assert.Equal(t, 15, cw.TotalTokens(), "token metrics should be updated")
+}
+
+// TestCallModelStreamingWithOpts tests streaming with options.
+func TestCallModelStreamingWithOpts(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockStreamingModel{
+		chunks: []string{"Response"},
+		events: []Record{
+			{
+				Source:    ModelResp,
+				Content:   "Response",
+				Live:      true,
+				EstTokens: 1,
+			},
+		},
+		tokensUsed: 5,
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("test prompt")
+	assert.NoError(t, err)
+
+	callback := func(chunk StreamChunk) error {
+		return nil
+	}
+
+	// Test with opts
+	opts := CallModelOpts{DisableTools: true}
+	response, err := cw.CallModelStreamingWithOpts(context.Background(), opts, callback)
+	assert.NoError(t, err)
+	assert.Equal(t, "Response", response)
+
+	// Verify opts were passed to model
+	assert.NotNil(t, mockModel.lastOpts, "opts should be passed to model")
+	assert.True(t, mockModel.lastOpts.DisableTools, "DisableTools should be true")
+}
+
+// TestCallModelStreamingFallback tests fallback to non-streaming when model doesn't support streaming.
+func TestCallModelStreamingFallback(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	// Use a regular mock model that doesn't implement streaming
+	mockModel := &MockModel{
+		events: []Record{
+			{
+				Source:    ModelResp,
+				Content:   "Fallback response",
+				Live:      true,
+				EstTokens: 2,
+			},
+		},
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("test prompt")
+	assert.NoError(t, err)
+
+	// Callback should not be called for non-streaming models
+	callbackCalled := false
+	callback := func(chunk StreamChunk) error {
+		callbackCalled = true
+		return nil
+	}
+
+	// Call streaming method - should fall back to CallModelWithOpts
+	response, err := cw.CallModelStreaming(context.Background(), callback)
+	assert.NoError(t, err)
+	assert.Equal(t, "Fallback response", response)
+
+	// Callback should not have been called (fallback doesn't use streaming)
+	assert.False(t, callbackCalled, "callback should not be called for non-streaming fallback")
+
+	// Verify response was still persisted
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+	var foundResponse bool
+	for _, rec := range recs {
+		if rec.Source == ModelResp && rec.Content == "Fallback response" {
+			foundResponse = true
+			break
+		}
+	}
+	assert.True(t, foundResponse, "response should be persisted even with fallback")
+}
+
+// TestCallModelStreamingPersistence verifies that persistence happens after stream completes.
+func TestCallModelStreamingPersistence(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	// Create model that streams multiple chunks
+	mockModel := &mockStreamingModel{
+		chunks: []string{"Chunk", "1", " ", "Chunk", "2"},
+		events: []Record{
+			{
+				Source:    ModelResp,
+				Content:   "Chunk1 Chunk2",
+				Live:      true,
+				EstTokens: 4,
+			},
+		},
+		tokensUsed: 20,
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("initial prompt")
+	assert.NoError(t, err)
+
+	// Track when callback is called vs when persistence happens
+	var callbackInvoked bool
+	var chunksReceived []string
+	callback := func(chunk StreamChunk) error {
+		callbackInvoked = true
+		if chunk.Delta != "" {
+			chunksReceived = append(chunksReceived, chunk.Delta)
+		}
+		// Before stream completes, response should not be in database yet
+		if !chunk.Done {
+			recs, _ := cw.LiveRecords()
+			// Should only have the prompt, not the response
+			responseCount := 0
+			for _, rec := range recs {
+				if rec.Source == ModelResp {
+					responseCount++
+				}
+			}
+			assert.Equal(t, 0, responseCount, "response should not be persisted during streaming")
+		}
+		return nil
+	}
+
+	// Call streaming method
+	response, err := cw.CallModelStreaming(context.Background(), callback)
+	assert.NoError(t, err)
+	assert.Equal(t, "Chunk1 Chunk2", response)
+
+	// Verify callback was invoked
+	assert.True(t, callbackInvoked, "callback should have been invoked")
+	assert.Greater(t, len(chunksReceived), 0, "should have received chunks")
+
+	// Verify persistence happened AFTER stream completed
+	recs, err := cw.LiveRecords()
+	assert.NoError(t, err)
+
+	// Should now have both prompt and response
+	responseCount := 0
+	var persistedResponse *Record
+	for i := range recs {
+		if recs[i].Source == ModelResp {
+			responseCount++
+			persistedResponse = &recs[i]
+		}
+	}
+	assert.Equal(t, 1, responseCount, "response should be persisted after stream completes")
+	assert.NotNil(t, persistedResponse, "response record should exist")
+	assert.Equal(t, "Chunk1 Chunk2", persistedResponse.Content, "persisted content should match final response")
+
+	// Verify token metrics were updated
+	assert.Equal(t, 20, cw.TotalTokens(), "token metrics should be updated after persistence")
+}
+
+// TestCallModelStreamingCallbackError tests error handling when callback returns error.
+func TestCallModelStreamingCallbackError(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockStreamingModel{
+		chunks: []string{"Chunk1", "Chunk2"},
+		events: []Record{
+			{
+				Source:  ModelResp,
+				Content: "Chunk1Chunk2",
+				Live:    true,
+			},
+		},
+		tokensUsed: 10,
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("test prompt")
+	assert.NoError(t, err)
+
+	callbackError := fmt.Errorf("callback error")
+	callback := func(chunk StreamChunk) error {
+		// Return error on first chunk
+		if chunk.Delta == "Chunk1" {
+			return callbackError
+		}
+		return nil
+	}
+
+	// Call should fail with callback error
+	_, err = cw.CallModelStreaming(context.Background(), callback)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "callback error", "error should propagate from callback")
+}
+
+// TestCallModelStreamingChunkError tests error handling when chunk contains error.
+func TestCallModelStreamingChunkError(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockStreamingModel{
+		chunks:      []string{"Chunk1"},
+		events:      []Record{},
+		tokensUsed:  5,
+		shouldError: true, // Enable error chunk
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("test prompt")
+	assert.NoError(t, err)
+
+	callback := func(chunk StreamChunk) error {
+		// Return chunk error if present
+		if chunk.Error != nil {
+			return chunk.Error
+		}
+		return nil
+	}
+
+	// Call should fail with stream error
+	_, err = cw.CallModelStreaming(context.Background(), callback)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "stream error", "chunk error should propagate")
+}
+
+// testStreamingMiddleware implements StreamingMiddleware for testing
+type testStreamingMiddleware struct {
+	mu                sync.Mutex
+	onStartCalled     bool
+	onChunkCalls      []StreamChunk
+	onCompleteCalled  bool
+	completeText      string
+	completeTokens    int
+	onStartError      error
+	onChunkError      error
+	onCompleteError   error
+	chunkErrorOnIndex int // If set to >= 0, return error on this chunk index
+}
+
+func (tm *testStreamingMiddleware) OnToolCall(ctx context.Context, name, args string) {
+	// No-op for tool calls
+}
+
+func (tm *testStreamingMiddleware) OnToolResult(ctx context.Context, name, result string, err error) {
+	// No-op for tool results
+}
+
+func (tm *testStreamingMiddleware) OnStreamStart(ctx context.Context) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.onStartCalled = true
+	return tm.onStartError
+}
+
+func (tm *testStreamingMiddleware) OnStreamChunk(ctx context.Context, chunk StreamChunk) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.onChunkCalls = append(tm.onChunkCalls, chunk)
+	// Return error if this is the specified chunk index
+	if tm.chunkErrorOnIndex >= 0 && len(tm.onChunkCalls)-1 == tm.chunkErrorOnIndex {
+		return tm.onChunkError
+	}
+	return nil
+}
+
+func (tm *testStreamingMiddleware) OnStreamComplete(ctx context.Context, fullText string, tokens int) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.onCompleteCalled = true
+	tm.completeText = fullText
+	tm.completeTokens = tokens
+	return tm.onCompleteError
+}
+
+// TestStreamingMiddlewareOrder tests that middleware is called in correct order
+func TestStreamingMiddlewareOrder(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockStreamingModel{
+		chunks: []string{"Hello", " ", "world", "!"},
+		events: []Record{
+			{
+				Source:    ModelResp,
+				Content:   "Hello world!",
+				Live:      true,
+				EstTokens: 3,
+			},
+		},
+		tokensUsed: 15,
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("test prompt")
+	assert.NoError(t, err)
+
+	// Create middleware that tracks call order
+	mw1 := &testStreamingMiddleware{}
+	mw2 := &testStreamingMiddleware{}
+
+	cw.AddMiddleware(mw1)
+	cw.AddMiddleware(mw2)
+
+	callback := func(chunk StreamChunk) error {
+		return nil
+	}
+
+	// Call streaming method
+	_, err = cw.CallModelStreaming(context.Background(), callback)
+	assert.NoError(t, err)
+
+	// Verify both middleware were called
+	mw1.mu.Lock()
+	mw2.mu.Lock()
+	assert.True(t, mw1.onStartCalled, "mw1 OnStreamStart should be called")
+	assert.True(t, mw2.onStartCalled, "mw2 OnStreamStart should be called")
+	assert.True(t, mw1.onCompleteCalled, "mw1 OnStreamComplete should be called")
+	assert.True(t, mw2.onCompleteCalled, "mw2 OnStreamComplete should be called")
+	assert.Equal(t, "Hello world!", mw1.completeText, "mw1 should receive complete text")
+	assert.Equal(t, "Hello world!", mw2.completeText, "mw2 should receive complete text")
+	assert.Equal(t, 15, mw1.completeTokens, "mw1 should receive token count")
+	assert.Equal(t, 15, mw2.completeTokens, "mw2 should receive token count")
+
+	// Verify OnStreamStart was called before chunks
+	assert.True(t, mw1.onStartCalled, "OnStreamStart should be called")
+	assert.Greater(t, len(mw1.onChunkCalls), 0, "OnStreamChunk should be called")
+
+	// Verify OnStreamChunk was called for each chunk (plus done chunk)
+	// We expect 4 chunks + 1 done chunk = 5 total
+	expectedChunkCount := len(mockModel.chunks) + 1 // chunks + done
+	assert.Equal(t, expectedChunkCount, len(mw1.onChunkCalls), "mw1 should receive all chunks")
+	assert.Equal(t, expectedChunkCount, len(mw2.onChunkCalls), "mw2 should receive all chunks")
+
+	// Verify chunks were received in order
+	for i, chunkText := range mockModel.chunks {
+		assert.Equal(t, chunkText, mw1.onChunkCalls[i].Delta, "chunk %d should match", i)
+		assert.False(t, mw1.onChunkCalls[i].Done, "chunk %d should not be done", i)
+	}
+	// Last chunk should be done
+	assert.True(t, mw1.onChunkCalls[len(mw1.onChunkCalls)-1].Done, "last chunk should be done")
+
+	// Verify OnStreamComplete was called after chunks
+	assert.True(t, mw1.onCompleteCalled, "OnStreamComplete should be called")
+	mw1.mu.Unlock()
+	mw2.mu.Unlock()
+}
+
+// TestStreamingMiddlewareErrorPropagation tests that middleware errors propagate correctly
+func TestStreamingMiddlewareErrorPropagation(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockStreamingModel{
+		chunks: []string{"Hello", " ", "world"},
+		events: []Record{
+			{
+				Source:    ModelResp,
+				Content:   "Hello world",
+				Live:      true,
+				EstTokens: 2,
+			},
+		},
+		tokensUsed: 10,
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("test prompt")
+	assert.NoError(t, err)
+
+	t.Run("OnStreamStart error", func(t *testing.T) {
+		mw := &testStreamingMiddleware{
+			onStartError: fmt.Errorf("start error"),
+		}
+		cw.middleware = []Middleware{mw}
+
+		_, err = cw.CallModelStreaming(context.Background(), nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "middleware OnStreamStart error")
+		assert.Contains(t, err.Error(), "start error")
+	})
+
+	t.Run("OnStreamChunk error", func(t *testing.T) {
+		mw := &testStreamingMiddleware{
+			onChunkError:      fmt.Errorf("chunk error"),
+			chunkErrorOnIndex: 0, // Error on first chunk
+		}
+		cw.middleware = []Middleware{mw}
+
+		_, err = cw.CallModelStreaming(context.Background(), nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "middleware OnStreamChunk error")
+		assert.Contains(t, err.Error(), "chunk error")
+	})
+
+	t.Run("OnStreamComplete error", func(t *testing.T) {
+		mw := &testStreamingMiddleware{
+			onCompleteError: fmt.Errorf("complete error"),
+		}
+		cw.middleware = []Middleware{mw}
+
+		_, err = cw.CallModelStreaming(context.Background(), nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "middleware OnStreamComplete error")
+		assert.Contains(t, err.Error(), "complete error")
+	})
+}
+
+// TestStreamingMiddlewareOptionalMethods tests that middleware without streaming methods still works
+func TestStreamingMiddlewareOptionalMethods(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockStreamingModel{
+		chunks: []string{"Hello"},
+		events: []Record{
+			{
+				Source:    ModelResp,
+				Content:   "Hello",
+				Live:      true,
+				EstTokens: 1,
+			},
+		},
+		tokensUsed: 5,
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("test prompt")
+	assert.NoError(t, err)
+
+	// Create middleware that only implements basic Middleware (not StreamingMiddleware)
+	basicMw := &testMiddleware{}
+
+	// Create middleware that implements StreamingMiddleware
+	streamingMw := &testStreamingMiddleware{}
+
+	cw.AddMiddleware(basicMw)
+	cw.AddMiddleware(streamingMw)
+
+	callback := func(chunk StreamChunk) error {
+		return nil
+	}
+
+	// Call should succeed - basic middleware should be ignored for streaming
+	_, err = cw.CallModelStreaming(context.Background(), callback)
+	assert.NoError(t, err)
+
+	// Verify streaming middleware was called
+	streamingMw.mu.Lock()
+	assert.True(t, streamingMw.onStartCalled, "streaming middleware OnStreamStart should be called")
+	assert.Greater(t, len(streamingMw.onChunkCalls), 0, "streaming middleware OnStreamChunk should be called")
+	assert.True(t, streamingMw.onCompleteCalled, "streaming middleware OnStreamComplete should be called")
+	streamingMw.mu.Unlock()
+
+	// Verify basic middleware was not called for streaming (it doesn't implement StreamingMiddleware)
+	// This is expected - only middleware implementing StreamingMiddleware get streaming callbacks
+}
+
+// TestStreamingMiddlewareMultipleMiddleware tests multiple middleware with mixed implementations
+func TestStreamingMiddlewareMultipleMiddleware(t *testing.T) {
+	db, err := NewContextDB(":memory:")
+	assert.NoError(t, err)
+	defer db.Close()
+
+	mockModel := &mockStreamingModel{
+		chunks: []string{"Test"},
+		events: []Record{
+			{
+				Source:    ModelResp,
+				Content:   "Test",
+				Live:      true,
+				EstTokens: 1,
+			},
+		},
+		tokensUsed: 5,
+	}
+
+	cw, err := NewContextWindow(db, mockModel, "test-context")
+	assert.NoError(t, err)
+
+	err = cw.AddPrompt("test prompt")
+	assert.NoError(t, err)
+
+	// Create multiple middleware - some with streaming, some without
+	basicMw1 := &testMiddleware{}
+	streamingMw1 := &testStreamingMiddleware{}
+	basicMw2 := &testMiddleware{}
+	streamingMw2 := &testStreamingMiddleware{}
+
+	cw.AddMiddleware(basicMw1)
+	cw.AddMiddleware(streamingMw1)
+	cw.AddMiddleware(basicMw2)
+	cw.AddMiddleware(streamingMw2)
+
+	callback := func(chunk StreamChunk) error {
+		return nil
+	}
+
+	// Call should succeed
+	_, err = cw.CallModelStreaming(context.Background(), callback)
+	assert.NoError(t, err)
+
+	// Verify only streaming middleware were called
+	streamingMw1.mu.Lock()
+	streamingMw2.mu.Lock()
+	assert.True(t, streamingMw1.onStartCalled, "streamingMw1 should be called")
+	assert.True(t, streamingMw2.onStartCalled, "streamingMw2 should be called")
+	assert.True(t, streamingMw1.onCompleteCalled, "streamingMw1 should complete")
+	assert.True(t, streamingMw2.onCompleteCalled, "streamingMw2 should complete")
+	streamingMw1.mu.Unlock()
+	streamingMw2.mu.Unlock()
 }
